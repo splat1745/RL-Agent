@@ -22,3 +22,7 @@ config.json
 
 # videos
 *.mp4
+
+# model update logs
+*.txt
+perf_log.txt

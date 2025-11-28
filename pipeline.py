@@ -6,7 +6,7 @@ Auto-Farmer Pipeline Commands:
    Example: python pipeline.py sample 300 session_01
 
 2. Train Model (Combined Dataset):
-   python pipeline.py train
+   python pipeline.py train "path/to/your/weights.pt"
 
 3. Run Inference & Auto-Label:
    python pipeline.py infer <model_path> <frames_dir>
@@ -222,7 +222,7 @@ def run_scheduled_training(model_source, data_yaml, project_dir, base_name):
         'batch': 32,
     }
 
-    # --- Phase 1: Light Augs (0-100 epochs) ---
+    # --- Phase 1: Light Augs (0-70 epochs) ---
     print(f"\n--- Starting Phase 1: Light Augmentations ({base_name}) ---")
     if isinstance(model_source, str):
         model = YOLO(model_source)
@@ -232,7 +232,7 @@ def run_scheduled_training(model_source, data_yaml, project_dir, base_name):
     p1_name = f"{base_name}_p1"
     model.train(
         data=data_yaml,
-        epochs=100,
+        epochs=70,
         name=p1_name,
         
         # Light Augs (Dataset is already augmented)
@@ -295,7 +295,7 @@ def run_scheduled_training(model_source, data_yaml, project_dir, base_name):
     p2_name = f"{base_name}_p2"
     model.train(
         data=data_yaml,
-        epochs=120,
+        epochs=100,
         name=p2_name,
         
         # Very Light / Clean
@@ -368,7 +368,7 @@ def run_scheduled_training(model_source, data_yaml, project_dir, base_name):
         
     return final_best
 
-def train_model():
+def train_model(initial_weights=None):
     r"""
     Combined training on both datasets (Local + T: Drive) with obstacles removed.
     Uses 3-Phase Scheduled Augmentations.
@@ -436,15 +436,13 @@ def train_model():
     # --- 3. Train (One Pass) ---
     print("\n=== STEP 2: Starting Combined Training ===")
     
-    # Start with COCO checkpoint (pass the architecture path string so we can
-    # reliably recreate the same architecture across phases)
-    initial_model = "yolo11s.pt"
-    # Allow automatic download by Ultralytics if it's a standard model name
-    if not os.path.exists(initial_model) and "yolo" not in initial_model:
-         if os.path.exists("yolov8n.pt"):
-            initial_model = "yolov8n.pt"
-         else:
-            raise FileNotFoundError("No starting checkpoint found: yolo11s.pt or yolov8n.pt")
+    if initial_weights:
+        initial_model = initial_weights
+        print(f"Resuming/Retraining from provided weights: {initial_model}")
+    else:
+        # Start with COCO checkpoint (pass the architecture path string so we can
+        # reliably recreate the same architecture across phases)
+        initial_model = "yolo11s.pt"
 
     # Run 3-Phase Training (pass the architecture string)
     best_weights = run_scheduled_training(
@@ -606,7 +604,10 @@ if __name__ == "__main__":
             
         sample_frames(count, subdir)
     elif cmd == "train":
-        train_model()
+        weights_path = None
+        if len(sys.argv) >= 3:
+            weights_path = sys.argv[2]
+        train_model(weights_path)
     elif cmd == "infer":
         if len(sys.argv) >= 4:
             auto_label_inference(sys.argv[2], sys.argv[3])

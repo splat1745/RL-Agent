@@ -126,6 +126,9 @@ def agent_loop(agent, memory, controller, state_manager, update_timestep, model_
         action_idx, log_prob = agent.select_action(pixel_obs)
         action_name = get_action_name(action_idx)
         
+        # Debug Print
+        print(f"Agent Step {time_step}: Action={action_name}")
+        
         # 4. Execute Action (Blocking for duration)
         controller.execute(action_name, duration=0.3)
         

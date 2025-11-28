@@ -24,7 +24,16 @@ def calculate_reward(obs, action_idx, state_manager):
     
     # 1. Distance Reward (Chase)
     # Reward getting closer (negative delta)
-    reward += -delta_enemy
+    # Increased weight to encourage aggressive chasing
+    reward += -delta_enemy * 2.0
+    
+    # Proximity Bonus (Maintain close range)
+    # obs[4], obs[5] are edx, edy (normalized)
+    if len(obs) > 5:
+        edx, edy = obs[4], obs[5]
+        dist = np.sqrt(edx*edx + edy*edy)
+        if dist < 0.15: # Close range (approx 100 pixels)
+            reward += 0.05 # Small bonus per frame for staying close
     
     # 2. Attack Reward (Hit)
     if enemy_flash > 0.1:
@@ -35,7 +44,9 @@ def calculate_reward(obs, action_idx, state_manager):
         # Use a small threshold to avoid float noise, though health is usually discrete-ish
         if current_health < state_manager.prev_health - 0.001:
             reward -= 2.0
-            
+
+     # add constant penalty to always encourage improvement
+    reward -= 0.01       
     state_manager.update(obs)
     
     return reward

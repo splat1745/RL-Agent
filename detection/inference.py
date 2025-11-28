@@ -74,6 +74,13 @@ class Perception:
             self.enemy_health_template = cv2.imread("EnemyHealth.png")
             if self.enemy_health_template is not None:
                 print("Loaded EnemyHealth.png template.")
+
+        # Hit Template
+        self.hit_template = None
+        if os.path.exists("TemplateHit.png"):
+            self.hit_template = cv2.imread("TemplateHit.png")
+            if self.hit_template is not None:
+                print("Loaded TemplateHit.png template.")
         
         # UI Templates for Cooldowns and Bars
         self.ui_templates = {}
@@ -172,14 +179,17 @@ class Perception:
                     try:
                         return cv2.legacy.TrackerCSRT_create()
                     except AttributeError:
-                        print("Warning: No tracker found. Tracking disabled.")
+                        # Only print warning once
+                        if not hasattr(self, '_tracker_warning_shown'):
+                            print("Warning: No tracker found. Tracking disabled.")
+                            self._tracker_warning_shown = True
                         return None
 
     def detect_hit_confirm(self, frame, enemy_box, player_box, tid):
         """
         Advanced Hit Detection Pipeline:
         1. Expand Box & Crop
-        2. HSV Flash Detection (V > thresh, S < thresh)
+        2. HSV Flash Detection (V > thresh, S < thresh) OR Template Match
         3. Edge Change Detection (Canny Diff)
         4. Player Suppression
         5. Signal Smoothing
@@ -201,10 +211,10 @@ class Perception:
         
         # 2. HSV Flash Mask
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        # White Flash: High Value (>200), Low Saturation (<50)
-        # Adjust thresholds as needed
+        # White Flash: High Value (>200), Low Saturation (<60)
+        # Relaxed thresholds to avoid false negatives
         lower_white = np.array([0, 0, 200])
-        upper_white = np.array([180, 50, 255])
+        upper_white = np.array([180, 60, 255])
         flash_mask = cv2.inRange(hsv, lower_white, upper_white)
         
         # Cluster Size Check (Remove noise)
@@ -213,29 +223,50 @@ class Perception:
         flash_mask = cv2.morphologyEx(flash_mask, cv2.MORPH_OPEN, kernel)
         
         flash_pixels = cv2.countNonZero(flash_mask)
-        has_flash = flash_pixels > 20 # Threshold for cluster size
+        has_flash = flash_pixels > 30 # Lowered threshold for cluster size
         
+        # Template Match Check
+        has_template_match = False
+        if self.hit_template is not None:
+            th, tw = self.hit_template.shape[:2]
+            ch, cw = crop.shape[:2]
+            if ch >= th and cw >= tw:
+                res = cv2.matchTemplate(crop, self.hit_template, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, _ = cv2.minMaxLoc(res)
+                if max_val > 0.6: # Threshold for hit spark template
+                    has_template_match = True
+
+        # Combined Visual Hit Signal
+        is_visual_hit = has_flash or has_template_match
+
         # 3. Edge Change Map (Impact)
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-        
+        # Optimization: Skip edge check if no visual hit detected (Lazy Eval)
         has_edge_change = False
-        if tid in self.prev_edges:
-            prev = self.prev_edges[tid]
-            if prev.shape == edges.shape:
-                # Compute difference
-                diff = cv2.absdiff(edges, prev)
-                diff_pixels = cv2.countNonZero(diff)
-                # If significant edge change (impact frame often changes edges drastically)
-                if diff_pixels > 50: 
-                    has_edge_change = True
-        
-        self.prev_edges[tid] = edges
+        if is_visual_hit:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            
+            if tid in self.prev_edges:
+                prev = self.prev_edges[tid]
+                if prev.shape == edges.shape:
+                    # Compute difference
+                    diff = cv2.absdiff(edges, prev)
+                    diff_pixels = cv2.countNonZero(diff)
+                    # If significant edge change (impact frame often changes edges drastically)
+                    if diff_pixels > 40: # Slightly relaxed
+                        has_edge_change = True
+            
+            self.prev_edges[tid] = edges
+        else:
+            # Still update edges for next frame
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            self.prev_edges[tid] = edges
         
         # 4. Suppress Player
         # If player box overlaps with this crop, mask it out
-        if player_box:
-            px, py, pw, ph = player_box
+        if player_box is not None and len(player_box) >= 4:
+            px, py, pw, ph = player_box[:4]
             # Convert player box to crop coordinates
             px1 = int(px - pw/2) - x1
             py1 = int(py - ph/2) - y1
@@ -254,13 +285,13 @@ class Perception:
                 # Re-check flash
                 if cv2.countNonZero(flash_mask) <= 20:
                     has_flash = False
+                # Note: We don't suppress template match here as it's more specific
 
         # 5. Combine & Smooth
-        # Hit = Flash AND (Edge Change OR Persist)
-        # Actually user said: "Reward hit only if: hit mask persists 2 frames OR hit-stun..."
-        
+        # Hit = (Flash OR Template) AND (Edge Change OR Template)
+        # If template matches strongly, we trust it even without edge change
         is_hit = False
-        if has_flash:
+        if (has_flash and has_edge_change) or has_template_match:
             is_hit = True
             
         self.hit_signals[tid].append(is_hit)
@@ -340,19 +371,32 @@ class Perception:
         Estimates global camera motion (dx, dy) using sparse optical flow on background features.
         Returns (dx, dy) in pixels.
         """
+        # Optimization: Resize to small resolution for flow calculation
+        small_h, small_w = 160, 160
+        small_gray = cv2.resize(frame_gray, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+        
+        scale_x = frame_gray.shape[1] / small_w
+        scale_y = frame_gray.shape[0] / small_h
+        
         # Initialize points if needed (KLT style)
         if self.prev_pts is None or len(self.prev_pts) < 50:
             # Create mask to ignore known moving objects (from last frame)
-            mask = np.ones_like(frame_gray, dtype=np.uint8) * 255
+            mask = np.ones_like(small_gray, dtype=np.uint8) * 255
             
             if self.last_det:
                 def mask_rect(rect):
                     if rect:
                         x, y, w, h = rect[:4]
+                        # Scale to small
+                        x /= scale_x
+                        y /= scale_y
+                        w /= scale_x
+                        h /= scale_y
+                        
                         x1 = int(max(0, x - w/2))
                         y1 = int(max(0, y - h/2))
-                        x2 = int(min(frame_gray.shape[1], x + w/2))
-                        y2 = int(min(frame_gray.shape[0], y + h/2))
+                        x2 = int(min(small_w, x + w/2))
+                        y2 = int(min(small_h, y + h/2))
                         cv2.rectangle(mask, (x1, y1), (x2, y2), 0, -1)
 
                 mask_rect(self.last_det.get("player"))
@@ -360,27 +404,17 @@ class Perception:
                     mask_rect(enemy)
 
             # Use GFTT but only when points are low
-            # Increase maxCorners and minDistance for better coverage
-            self.prev_pts = cv2.goodFeaturesToTrack(frame_gray, mask=mask, maxCorners=500, qualityLevel=0.01, minDistance=10)
+            self.prev_pts = cv2.goodFeaturesToTrack(small_gray, mask=mask, maxCorners=200, qualityLevel=0.01, minDistance=5)
         
         if self.prev_gray is None:
-            self.prev_gray = frame_gray
+            self.prev_gray = small_gray
             return 0.0, 0.0
             
         dx, dy = 0.0, 0.0
         
         if self.prev_pts is not None and len(self.prev_pts) > 0:
             # Track to current frame
-            # Note: nextPts=None is valid in Python OpenCV bindings but type checkers might complain.
-            # We pass None as positional argument for nextPts.
-            # Explicitly passing None for nextPts causes issues in some versions/type checkers.
-            # We can pass an empty array or let it be created.
-            # The signature is calcOpticalFlowPyrLK(prevImg, nextImg, prevPts, nextPts, ...)
-            # If we pass None, it should work. If not, we can try passing None as keyword arg?
-            # Or just rely on positional.
-            # The error "None is not assignable to UMat" suggests strict type checking.
-            # Let's try passing None explicitly.
-            p1, st, err = cv2.calcOpticalFlowPyrLK(self.prev_gray, frame_gray, self.prev_pts, None, winSize=(21, 21), maxLevel=2)
+            p1, st, err = cv2.calcOpticalFlowPyrLK(self.prev_gray, small_gray, self.prev_pts, None, winSize=(15, 15), maxLevel=2)
             
             # Select good points
             if p1 is not None:
@@ -409,6 +443,10 @@ class Perception:
                     else:
                         dx, dy = med_dx, med_dy
                     
+                    # Scale back to original resolution
+                    dx *= scale_x
+                    dy *= scale_y
+                    
                     # Update points for next frame
                     self.prev_pts = good_new.reshape(-1, 1, 2)
                 else:
@@ -416,7 +454,7 @@ class Perception:
             else:
                 self.prev_pts = None
         
-        self.prev_gray = frame_gray
+        self.prev_gray = small_gray
         return dx, dy
 
     def detect(self, frame):
@@ -563,7 +601,9 @@ class Perception:
                 det_dict["items"].append(xywh)
 
         # Identify Player
-        target_center = np.array([INPUT_SIZE * 0.45, INPUT_SIZE * 0.5])
+        # Updated: Center (offset left) Downward
+        # x=0.45 (Left of center), y=0.6 (Downward)
+        target_center = np.array([INPUT_SIZE * 0.45, INPUT_SIZE * 0.6])
         best_score = float('inf')
         player_candidate = None
         
@@ -576,7 +616,8 @@ class Perception:
             if len(hist) >= 5:
                 movement_score = np.linalg.norm(np.array(hist[-1]) - np.array(hist[-5]))
             
-            score = (movement_score * 2.0) + (dist_to_center * 1.0)
+            # Increased weight for distance to center to prevent identity swapping
+            score = (movement_score * 1.0) + (dist_to_center * 3.0)
             if score < best_score:
                 best_score = score
                 player_candidate = (tid, xywh, conf)
