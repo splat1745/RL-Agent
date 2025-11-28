@@ -1,0 +1,24 @@
+# Ignore directories for storing large files
+data
+datasets
+raw_videos
+
+# Ignore model weights and checkpoints
+*.pt
+*.ckpt
+checkpoints
+weights
+# Ignore logs and run directories
+runs
+logs
+# Ignore virtual environment directories
+venv
+env
+__pycache__
+*.pyc
+
+# configs
+config.json
+
+# videos
+*.mp4

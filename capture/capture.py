@@ -50,6 +50,7 @@ class ScreenCapture:
         
         hwnd = win32gui.FindWindow(None, self.window_title)
         if hwnd:
+            self.hwnd = hwnd # Store hwnd
             # GetWindowRect returns (left, top, right, bottom)
             rect = win32gui.GetWindowRect(hwnd)
             monitor_idx = self._get_monitor_for_window(hwnd)
@@ -83,6 +84,69 @@ class ScreenCapture:
 
         return None, 0
 
+    def _init_camera(self, monitor_idx):
+        """
+        Initializes the dxcam camera.
+        Attempts to find the correct device and output index corresponding to the monitor_idx.
+        """
+        # Try direct mapping first (monitor_idx -> output_idx on default device)
+        try:
+            return dxcam.create(output_idx=monitor_idx, output_color="BGR")
+        except IndexError:
+            pass # Failed, try searching
+        except Exception as e:
+            print(f"dxcam create failed: {e}")
+
+        print(f"Direct mapping for monitor {monitor_idx} failed. Searching for correct dxcam output...")
+        
+        # We don't have the monitor rect here easily unless we pass it or recalculate.
+        # Let's just try to find *any* working camera on other devices if possible,
+        # or just iterate and print what we find.
+        # A better approach: Iterate all devices and outputs, and if we find one that works, use it?
+        # But which one is the *right* one?
+        # Without resolution matching, it's a guess.
+        # Let's try to match resolution if we can get it.
+        
+        target_w, target_h = 0, 0
+        try:
+            monitors = win32api.EnumDisplayMonitors()
+            if monitor_idx < len(monitors):
+                monitor_handle = monitors[monitor_idx][0]
+                monitor_info = win32api.GetMonitorInfo(monitor_handle) # type: ignore
+                rect = monitor_info['Monitor']
+                target_w = rect[2] - rect[0]
+                target_h = rect[3] - rect[1]
+        except Exception:
+            pass
+
+        for device_idx in range(4): # Check first 4 GPUs
+            for output_idx in range(4): # Check first 4 outputs
+                try:
+                    camera = dxcam.create(device_idx=device_idx, output_idx=output_idx, output_color="BGR")
+                    # If we have a target resolution, check it
+                    if target_w > 0 and target_h > 0:
+                        # dxcam doesn't expose width/height directly on the instance easily?
+                        # Actually it does: camera.width, camera.height (after start? or immediately?)
+                        # It seems to be available immediately.
+                        if camera.width == target_w and camera.height == target_h:
+                            print(f"Resolved to Device {device_idx}, Output {output_idx}")
+                            return camera
+                    else:
+                        # If we can't check resolution, just return the first one we find?
+                        # That's risky.
+                        pass
+                    
+                    # If not returned, maybe we should keep searching?
+                    # But we can't have multiple instances easily without cleaning up?
+                    # dxcam is singleton-ish.
+                except IndexError:
+                    break # No more outputs on this device
+                except Exception:
+                    continue
+        
+        print("Warning: Could not find exact match for monitor. Defaulting to primary (Device 0, Output 0).")
+        return dxcam.create(output_idx=0, output_color="BGR")
+
     def start(self):
         if self.running:
             return
@@ -97,9 +161,8 @@ class ScreenCapture:
             self.region = None # Full screen
 
         # Initialize camera for the specific monitor
-        # Note: dxcam.create is a bit expensive, so we only do it on start or if monitor changes (not handled here yet)
         if self.camera is None:
-             self.camera = dxcam.create(output_idx=monitor_idx, output_color="BGR")
+             self.camera = self._init_camera(monitor_idx)
         
         self.running = True
         
@@ -160,6 +223,19 @@ class ScreenCapture:
         except ValueError:
             print("Invalid input. Defaulting to Full Screen.")
             self.window_title = None
+
+    def focus(self):
+        """Brings the target window to the foreground."""
+        if hasattr(self, 'hwnd') and self.hwnd:
+            try:
+                # Windows sometimes blocks SetForegroundWindow. 
+                # We can try to force it by sending an Alt key press or attaching thread input, 
+                # but usually a simple call works if we are just starting.
+                win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
+                win32gui.SetForegroundWindow(self.hwnd)
+                print(f"Focused window: {self.window_title}")
+            except Exception as e:
+                print(f"Failed to focus window: {e}")
 
 # Global instance for easy import
 # Usage: from capture import capture_service; capture_service.start(); frame = capture_service.get_latest_frame()
