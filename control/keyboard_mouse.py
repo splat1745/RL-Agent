@@ -201,13 +201,13 @@ class InputController:
             # Move mouse in chunks to simulate smooth turning over duration
             steps = int(duration / 0.02)
             for _ in range(steps):
-                self.move_mouse_constrained(-50, 0) # Increased speed
+                self.move_mouse_constrained(-15, 0) # Reduced speed to prevent blur/exploits
                 time.sleep(0.01)
                 
         elif action_name == "turn_right":
             steps = int(duration / 0.02)
             for _ in range(steps):
-                self.move_mouse_constrained(50, 0) # Increased speed
+                self.move_mouse_constrained(15, 0) # Reduced speed to prevent blur/exploits
                 time.sleep(0.01)
 
     def _press(self, key):

@@ -16,16 +16,9 @@ ACTION_MAP = {
     5: "turn_left",
     6: "turn_right",
     7: "dash_back",  # Evasive Back (S + Q)
-    8: "click",      # Basic Attack
-    9: "1",          # Move 1
-    10: "2",         # Move 2
-    11: "3",         # Move 3
-    12: "4",         # Move 4
-    13: "r",         # Special / Teleport (R + Empty)
-    14: "r_1",       # Combo: R + 1 (Aim + Spam R)
-    15: "r_2",       # Combo: R + 2 (Aim + 2)
-    16: "dash_left", # Evasive Left (A + Q)
-    17: "dash_right" # Evasive Right (D + Q)
+    8: "dash_left",  # Evasive Left (A + Q)
+    9: "dash_right",  # Evasive Right (D + Q)
+    10: "dash_forward"  # Forward (not evasive) (W + Q)
 }
 
 def get_action_name(action_id):

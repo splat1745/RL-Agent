@@ -27,17 +27,72 @@ def calculate_reward(obs, action_idx, state_manager):
     # Increased weight to encourage aggressive chasing
     reward += -delta_enemy * 2.0
     
-    # Proximity Bonus (Maintain close range)
+    # Proximity Penalty (Stay within range)
     # obs[4], obs[5] are edx, edy (normalized)
     if len(obs) > 5:
         edx, edy = obs[4], obs[5]
         dist = np.sqrt(edx*edx + edy*edy)
-        if dist < 0.15: # Close range (approx 100 pixels)
-            reward += 0.05 # Small bonus per frame for staying close
+        
+        # Penalize if too far away (e.g. > 30% of screen width)
+        if dist > 0.3:
+            reward -= 0.1
+            
+        # Target Lock Reward: Encourage keeping enemy in center
+        # Boosted to strongly encourage facing the enemy
+        # Max +0.5 when centered
+        reward += max(0, (0.5 - dist) * 1.0)
+
+        # Action Penalty: Don't look away or retreat if you have the target!
+        # If enemy is visible (dist < 1.0 implies we have a valid coordinate, usually)
+        # And enemy is reasonably centered (dist < 0.4)
+        if dist < 0.4:
+            # 5: Turn Left, 6: Turn Right
+            if action_idx in [5, 6]:
+                reward -= 0.5 # Penalty for turning away when locked on
+            
+            # 3: S, 7: Dash Back
+            if action_idx in [3, 7]:
+                reward -= 0.5 # Penalty for retreating
+            
+            # 7: Dash Back, 8: Dash Left, 9: Dash Right
+            if action_idx in [7, 8, 9]:
+                reward -= 0.2 # Slight penalty for dashing when locked on (unless dodging, but we don't know that yet)
+
+    # Lost Target / Visibility Penalty
+    # obs[9] is time_since_seen_norm (0..1)
+    if len(obs) > 9:
+        time_since_seen = obs[9]
+        
+        # Immediate penalty for not seeing enemy this frame
+        # time_since_seen is normalized. If > 0 (approx), it means we didn't see it this frame.
+        # Using a small epsilon because of float precision/execution time
+        if time_since_seen > 0.01:
+            reward -= 0.1 # Constant pressure to find enemy
+            
+        # Heavy penalty if lost for longer (> 0.25s)
+        if time_since_seen > 0.05:
+            reward -= 0.5
     
-    # 2. Attack Reward (Hit)
-    if enemy_flash > 0.1:
-        reward += 2.0
+    # 2. Attack Reward (Hit) - REMOVED
+
+    # Lost Target / Visibility Penalty
+    # obs[9] is time_since_seen_norm (0..1)
+    if len(obs) > 9:
+        time_since_seen = obs[9]
+        
+        # Immediate penalty for not seeing enemy this frame
+        # time_since_seen is normalized. If > 0 (approx), it means we didn't see it this frame.
+        # Using a small epsilon because of float precision/execution time
+        if time_since_seen > 0.01:
+            reward -= 0.1 # Constant pressure to find enemy
+            
+        # Heavy penalty if lost for longer (> 0.25s)
+        if time_since_seen > 0.05:
+            reward -= 0.5
+    
+    # 2. Attack Reward (Hit) - REMOVED
+    # if enemy_flash > 0.1:
+    #    reward += 2.0
         
     # 3. Damage Penalty (Get Hit)
     if state_manager.prev_health is not None:

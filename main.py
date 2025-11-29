@@ -16,8 +16,10 @@ from utils.config_wizard import ConfigWizard, CONFIG_FILE
 
 from utils.state import StateManager
 
+from control.policy import DirectPolicy
+
 def preview_detection(perception, capture_service):
-    print("Starting Preview. Press 's' to start Agent, 'p' to quit.")
+    print("Starting Preview. Press 's' to start Agent, 'd' for Direct Policy, 'p' to quit.")
     fps_start_time = time.time()
     fps_counter = 0
     fps = 0
@@ -83,7 +85,15 @@ def preview_detection(perception, capture_service):
                 cv2.destroyWindow("ROI Logic Preview")
             except:
                 pass
-            break
+            return "agent"
+        elif key == ord('d'):
+            print("Starting Direct Policy...")
+            cv2.destroyWindow("Preview (Press 's' to Start)")
+            try:
+                cv2.destroyWindow("ROI Logic Preview")
+            except:
+                pass
+            return "direct"
         elif key == ord('p'):
             print("Quitting...")
             capture_service.stop()
@@ -101,6 +111,44 @@ frame_queue = queue.Queue(maxsize=1)
 obs_queue = queue.Queue(maxsize=1)
 status_queue = queue.Queue(maxsize=1) # (action_name, reward)
 stop_event = threading.Event()
+
+def direct_policy_loop(policy, controller, state_manager):
+    """
+    Runs the Direct Policy logic in a separate thread.
+    """
+    print("Direct Policy Thread Started.")
+    time_step = 0
+    
+    while not stop_event.is_set():
+        try:
+            # Get latest observation (blocking with timeout)
+            obs_data = obs_queue.get(timeout=0.1)
+            pixel_obs, vector_obs = obs_data
+        except queue.Empty:
+            continue
+            
+        # Policy -> Action
+        action_idx = policy.select_action(vector_obs)
+        action_name = get_action_name(action_idx)
+        
+        # Debug Print
+        print(f"Direct Step {time_step}: Action={action_name}")
+        
+        # Execute Action
+        controller.execute(action_name, duration=0.1) # Faster updates for direct control
+        
+        # Calculate Reward (Just for logging)
+        reward = calculate_reward(vector_obs, action_idx, state_manager)
+        
+        # Update Status
+        if status_queue.full():
+            try:
+                status_queue.get_nowait()
+            except queue.Empty:
+                pass
+        status_queue.put((action_name, reward))
+        
+        time_step += 1
 
 def agent_loop(agent, memory, controller, state_manager, update_timestep, model_path):
     """
@@ -200,15 +248,16 @@ def main():
     perception = init_perception(yolo_model_path)
     
     print("Initializing Agent...")
-    # Action Dim = 18
-    agent = PPOAgent(action_dim=18)
+    # Action Dim = 11 (Movement Only)
+    agent = PPOAgent(action_dim=11)
     
     # Load existing model
     model_path = "ppo_agent_pixel.pth" # Changed name to avoid conflict
     if os.path.exists(model_path):
         print(f"Loading existing model from {model_path}...")
         try:
-            agent.load(model_path)
+            # agent.load(model_path)
+            print("Skipping load to reset behavior loop.")
         except Exception as e:
             print(f"Error loading model: {e}. Starting from scratch.")
             
@@ -221,15 +270,22 @@ def main():
     # Focus the game window
     print("Focusing Game Window...")
     capture_service.focus()
-    time.sleep(1.0)
+    time.sleep(0.3)
     
     # 4. Preview Mode
-    preview_detection(perception, capture_service)
+    mode = preview_detection(perception, capture_service)
     
-    # 5. Start Agent Thread
-    agent_thread = threading.Thread(target=agent_loop, args=(agent, memory, controller, state_manager, 20, model_path))
-    agent_thread.daemon = True
-    agent_thread.start()
+    if mode == "agent":
+        # 5. Start Agent Thread
+        agent_thread = threading.Thread(target=agent_loop, args=(agent, memory, controller, state_manager, 20, model_path))
+        agent_thread.daemon = True
+        agent_thread.start()
+    elif mode == "direct":
+        # 5. Start Direct Policy Thread
+        policy = DirectPolicy()
+        agent_thread = threading.Thread(target=direct_policy_loop, args=(policy, controller, state_manager))
+        agent_thread.daemon = True
+        agent_thread.start()
     
     print("Starting Visualization Loop. Press 'p' to quit.")
     

@@ -160,7 +160,7 @@ class Perception:
         
         # Hit Detection State
         self.hit_signals = defaultdict(lambda: deque(maxlen=3)) # ID -> deque of bools
-        self.prev_edges = {} # ID -> edge_map
+        self.prev_crops = {} # ID -> prev_gray_crop
         self.hit_cooldowns = defaultdict(float) # ID -> timestamp
 
     def _create_tracker(self):
@@ -189,10 +189,10 @@ class Perception:
         """
         Advanced Hit Detection Pipeline:
         1. Expand Box & Crop
-        2. HSV Flash Detection (V > thresh, S < thresh) OR Template Match
-        3. Edge Change Detection (Canny Diff)
-        4. Player Suppression
-        5. Signal Smoothing
+        2. Edge Detection & Masking (Define Character Bounds)
+        3. Frame Differencing (Subtract Unchanging Pixels)
+        4. Average Brightness Check within Mask
+        5. Template Match (Override)
         """
         if frame is None: return 0.0
         
@@ -209,23 +209,9 @@ class Perception:
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0: return 0.0
         
-        # 2. HSV Flash Mask
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        # White Flash: High Value (>200), Low Saturation (<60)
-        # Relaxed thresholds to avoid false negatives
-        lower_white = np.array([0, 0, 200])
-        upper_white = np.array([180, 60, 255])
-        flash_mask = cv2.inRange(hsv, lower_white, upper_white)
-        
-        # Cluster Size Check (Remove noise)
-        # Morphological Open
-        kernel = np.ones((3,3), np.uint8)
-        flash_mask = cv2.morphologyEx(flash_mask, cv2.MORPH_OPEN, kernel)
-        
-        flash_pixels = cv2.countNonZero(flash_mask)
-        has_flash = flash_pixels > 30 # Lowered threshold for cluster size
-        
-        # Template Match Check
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+        # 2. Template Match Check (Keep as strong signal)
         has_template_match = False
         if self.hit_template is not None:
             th, tw = self.hit_template.shape[:2]
@@ -233,76 +219,74 @@ class Perception:
             if ch >= th and cw >= tw:
                 res = cv2.matchTemplate(crop, self.hit_template, cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, _ = cv2.minMaxLoc(res)
-                if max_val > 0.6: # Threshold for hit spark template
+                if max_val > 0.6: 
                     has_template_match = True
 
-        # Combined Visual Hit Signal
-        is_visual_hit = has_flash or has_template_match
-
-        # 3. Edge Change Map (Impact)
-        # Optimization: Skip edge check if no visual hit detected (Lazy Eval)
-        has_edge_change = False
-        if is_visual_hit:
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            edges = cv2.Canny(gray, 50, 150)
-            
-            if tid in self.prev_edges:
-                prev = self.prev_edges[tid]
-                if prev.shape == edges.shape:
-                    # Compute difference
-                    diff = cv2.absdiff(edges, prev)
-                    diff_pixels = cv2.countNonZero(diff)
-                    # If significant edge change (impact frame often changes edges drastically)
-                    if diff_pixels > 40: # Slightly relaxed
-                        has_edge_change = True
-            
-            self.prev_edges[tid] = edges
-        else:
-            # Still update edges for next frame
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            edges = cv2.Canny(gray, 50, 150)
-            self.prev_edges[tid] = edges
+        # 3. Edge Detection & Masking
+        # "ensure that edge detection is used, and anything within the bounds of edge detection is read"
+        edges = cv2.Canny(gray, 50, 150)
         
-        # 4. Suppress Player
-        # If player box overlaps with this crop, mask it out
-        if player_box is not None and len(player_box) >= 4:
-            px, py, pw, ph = player_box[:4]
-            # Convert player box to crop coordinates
-            px1 = int(px - pw/2) - x1
-            py1 = int(py - ph/2) - y1
-            px2 = int(px + pw/2) - x1
-            py2 = int(py + ph/2) - y1
-            
-            # Clip to crop bounds
-            px1 = max(0, px1)
-            py1 = max(0, py1)
-            px2 = min(crop.shape[1], px2)
-            py2 = min(crop.shape[0], py2)
-            
-            if px1 < px2 and py1 < py2:
-                # Zero out player area in flash mask
-                flash_mask[py1:py2, px1:px2] = 0
-                # Re-check flash
-                if cv2.countNonZero(flash_mask) <= 20:
-                    has_flash = False
-                # Note: We don't suppress template match here as it's more specific
+        # Dilate to connect edges and form a rough body mask
+        kernel = np.ones((3,3), np.uint8)
+        dilated_edges = cv2.dilate(edges, kernel, iterations=2)
+        
+        # Find contours to create a filled mask of the character
+        contours, _ = cv2.findContours(dilated_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask = np.zeros_like(gray)
+        
+        if contours:
+            # Assume largest contour is the character
+            c = max(contours, key=cv2.contourArea)
+            cv2.drawContours(mask, [c], -1, 255, -1) # Fill contour
+        else:
+            # Fallback: Use dilated edges if no closed contour
+            mask = dilated_edges
 
-        # 5. Combine & Smooth
-        # Hit = (Flash OR Template) AND (Edge Change OR Template)
-        # If template matches strongly, we trust it even without edge change
-        is_hit = False
-        if (has_flash and has_edge_change) or has_template_match:
-            is_hit = True
+        # 4. Brighter Average Color with Background Subtraction
+        # "subtract unchanging pixels (character instead of background)"
+        brightness_hit = False
+        
+        if tid in self.prev_crops:
+            prev_gray = self.prev_crops[tid]
+            
+            # Resize prev to match current (handle box size fluctuations)
+            if prev_gray.shape != gray.shape:
+                prev_gray = cv2.resize(prev_gray, (gray.shape[1], gray.shape[0]))
+            
+            # Subtract: Current - Prev (Detect Brightening only)
+            # cv2.subtract clips negatives to 0
+            diff = cv2.subtract(gray, prev_gray)
+            
+            # Filter: Only consider pixels that got SIGNIFICANTLY brighter (> 40)
+            # This removes noise from slight movement/texture shifts
+            _, diff_thresh = cv2.threshold(diff, 40, 255, cv2.THRESH_BINARY)
+            
+            # Apply Mask: Only check pixels within the character bounds
+            # diff_thresh is 255 where change > 40, 0 otherwise
+            masked_diff = cv2.bitwise_and(diff_thresh, diff_thresh, mask=mask)
+            
+            # Calculate ratio of character that flashed
+            mask_pixels = cv2.countNonZero(mask)
+            if mask_pixels > 0:
+                flash_pixels = cv2.countNonZero(masked_diff)
+                flash_ratio = flash_pixels / mask_pixels
+                
+                # Threshold: If > 15% of the character body flashed bright
+                if flash_ratio > 0.15: 
+                    brightness_hit = True
+        
+        # Update History
+        self.prev_crops[tid] = gray
+
+        # 5. Combine Signals
+        is_hit = brightness_hit or has_template_match
             
         self.hit_signals[tid].append(is_hit)
         
-        # Logic: Hit if signal persists for 2 frames in the last 3
+        # Persistence check (2 out of 3 frames)
         if sum(self.hit_signals[tid]) >= 2:
             return 1.0
             
-        # Fallback: Hit-Stun (Size Jitter or Freeze)
-        # We can check size jitter from tracking history in detect()
-        # For now, return 0.0
         return 0.0
 
     def _load_config(self):
@@ -480,8 +464,12 @@ class Perception:
         g_dx, g_dy = self._estimate_global_motion(gray)
         self.global_motion_history.append((g_dx, g_dy))
         
+        # Motion Blur Protection: Skip YOLO if camera is spinning too fast
+        # This prevents false positives from motion blur
+        is_stable = abs(g_dx) < 30.0 and abs(g_dy) < 30.0
+
         # Decide: Run YOLO or Track?
-        run_yolo = (self.frame_count % self.detection_interval == 0)
+        run_yolo = (self.frame_count % self.detection_interval == 0) and is_stable
         
         # Clear Debug
         self.debug_rois = {}
@@ -572,6 +560,8 @@ class Perception:
             
             for tid in to_remove:
                 del self.object_state[tid]
+                if tid in current_objects:
+                    del current_objects[tid]
 
         # --- CONSTRUCT OUTPUT ---
         det_dict = {
