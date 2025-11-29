@@ -70,15 +70,15 @@ class Perception:
         
         # Enemy Health Template
         self.enemy_health_template = None
-        if os.path.exists("EnemyHealth.png"):
-            self.enemy_health_template = cv2.imread("EnemyHealth.png")
+        if os.path.exists("images/EnemyHealth.png"):
+            self.enemy_health_template = cv2.imread("images/EnemyHealth.png")
             if self.enemy_health_template is not None:
                 print("Loaded EnemyHealth.png template.")
 
         # Hit Template
         self.hit_template = None
-        if os.path.exists("TemplateHit.png"):
-            self.hit_template = cv2.imread("TemplateHit.png")
+        if os.path.exists("images/TemplateHit.png"):
+            self.hit_template = cv2.imread("images/TemplateHit.png")
             if self.hit_template is not None:
                 print("Loaded TemplateHit.png template.")
         
@@ -87,12 +87,12 @@ class Perception:
         self.ui_rois = {} # name -> (x, y, w, h)
         
         ui_files = {
-            "move_1": "Lapse Blue.png",
-            "move_2": "Reversal Red.png",
-            "move_3": "Rapid Punches.png",
-            "move_4": "Twofold Kick.png",
-            "evasive_bar": "EvasiveBar.png",
-            "special_bar": "SpecialBar.png"
+            "move_1": "images/Lapse Blue.png",
+            "move_2": "images/Reversal Red.png",
+            "move_3": "images/Rapid Punches.png",
+            "move_4": "images/Twofold Kick.png",
+            "evasive_bar": "images/EvasiveBar.png",
+            "special_bar": "images/SpecialBar.png"
         }
         
         for name, filename in ui_files.items():
@@ -102,8 +102,8 @@ class Perception:
                     self.ui_templates[name] = tmpl
                     print(f"Loaded UI template: {filename}")
         
-        if os.path.exists("Health.png"):
-            self.health_template = cv2.imread("Health.png")
+        if os.path.exists("images/Health.png"):
+            self.health_template = cv2.imread("images/Health.png")
             if self.health_template is not None:
                 print("Loaded Health.png template.")
                 # Analyze template to find the "Max Health" bar area
