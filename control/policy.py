@@ -3,7 +3,12 @@ from control.actions import ACTION_MAP
 
 class DirectPolicy:
     def __init__(self):
-        pass
+        self.scan_timer = 0
+        self.last_seen_time = 0
+        self.last_edx = 0.0
+        self.recovery_step = 0
+        self.recovery_timer = 0
+        self.vertical_scan_dir = 1 # 1 for up, -1 for down
         
     def select_action(self, vector_obs):
         """
@@ -22,10 +27,53 @@ class DirectPolicy:
         edy = vector_obs[5]
         time_since_seen = vector_obs[9]
         
-        # If enemy not seen recently, maybe turn to find?
-        if time_since_seen > 0.1:
-            # Spin to find
-            return 6 # Turn Right
+        # If enemy not seen recently (approx 0.25s), enter recovery/scan mode
+        # Threshold 0.05 corresponds to 0.25s (since normalized by 5.0)
+        if time_since_seen > 0.05:
+            # Recovery Logic: Backtrack if we just lost it
+            if self.recovery_step < 3:
+                self.recovery_timer += 1
+                
+                # Cycle: Adjust (5 frames) -> Wait/Vertical (15 frames)
+                # Total cycle = 20 frames (~1 second at 20fps)
+                cycle_len = 20
+                
+                if self.recovery_timer > cycle_len:
+                    self.recovery_step += 1
+                    self.recovery_timer = 0
+                    self.vertical_scan_dir *= -1 # Toggle up/down
+                    return 0 # Transition
+                
+                if self.recovery_timer <= 5:
+                    # Phase 1: Horizontal Adjustment (Undo overshoot)
+                    if self.last_edx > 0: 
+                        return 5 # Turn Left
+                    else: 
+                        return 6 # Turn Right
+                else:
+                    # Phase 2: Wait & Vertical Scan
+                    if self.vertical_scan_dir > 0:
+                        return 19 # Look Up
+                    else:
+                        return 20 # Look Down
+            
+            # If recovery failed, start Burst Scan
+            self.scan_timer += 1
+            # Burst turn: Turn for 5 frames, wait for 10 frames
+            # Assuming ~20-30 FPS
+            cycle = 15
+            phase = self.scan_timer % cycle
+            
+            if phase < 5:
+                return 6 # Turn Right
+            else:
+                return 0 # Idle (Let camera settle for detection)
+        else:
+            # Enemy Visible
+            self.scan_timer = 0
+            self.recovery_step = 0
+            self.recovery_timer = 0
+            self.last_edx = edx
             
         # Calculate distance
         dist = np.sqrt(edx*edx + edy*edy)
@@ -33,7 +81,8 @@ class DirectPolicy:
         # 1. Aiming (Horizontal)
         # Center is 0.0. Range -1 to 1.
         # Threshold for turning
-        aim_threshold = 0.15
+        # Tightened to 0.05 to force "lock on" before moving
+        aim_threshold = 0.05
         
         if edx < -aim_threshold:
             return 5 # Turn Left

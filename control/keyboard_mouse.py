@@ -2,6 +2,7 @@ import time
 import win32api
 import win32con
 import ctypes
+import threading
 
 # DirectInput Key Codes
 DIK_1 = 0x02
@@ -84,6 +85,11 @@ class InputController:
         except:
             self.start_mouse_pos = (0, 0)
         self.accumulated_dy = 0 # Tracks vertical camera movement relative to start
+        
+        # Mouse Movement Tracking (Thread-Safe)
+        self.recent_mouse_dx = 0
+        self.recent_mouse_dy = 0
+        self._lock = threading.Lock()
 
     def move_mouse_constrained(self, dx, dy):
         """
@@ -114,6 +120,18 @@ class InputController:
         
         if dx != 0 or dy != 0:
             win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, int(dx), int(dy), 0, 0)
+            with self._lock:
+                self.recent_mouse_dx += dx
+                self.recent_mouse_dy += dy
+
+    def get_recent_movement(self):
+        """Returns accumulated mouse movement since last call."""
+        with self._lock:
+            dx = self.recent_mouse_dx
+            dy = self.recent_mouse_dy
+            self.recent_mouse_dx = 0
+            self.recent_mouse_dy = 0
+        return dx, dy
 
     def execute(self, action_name, duration=0.1):
         # Release previous key if different (and not a combo/instant)
@@ -201,13 +219,25 @@ class InputController:
             # Move mouse in chunks to simulate smooth turning over duration
             steps = int(duration / 0.02)
             for _ in range(steps):
-                self.move_mouse_constrained(-15, 0) # Reduced speed to prevent blur/exploits
+                self.move_mouse_constrained(-35, 0) # Increased speed for responsiveness
                 time.sleep(0.01)
                 
         elif action_name == "turn_right":
             steps = int(duration / 0.02)
             for _ in range(steps):
-                self.move_mouse_constrained(15, 0) # Reduced speed to prevent blur/exploits
+                self.move_mouse_constrained(35, 0) # Increased speed for responsiveness
+                time.sleep(0.01)
+
+        elif action_name == "look_up":
+            steps = int(duration / 0.02)
+            for _ in range(steps):
+                self.move_mouse_constrained(0, -3) # Slight vertical movement
+                time.sleep(0.01)
+
+        elif action_name == "look_down":
+            steps = int(duration / 0.02)
+            for _ in range(steps):
+                self.move_mouse_constrained(0, 3) # Slight vertical movement
                 time.sleep(0.01)
 
     def _press(self, key):

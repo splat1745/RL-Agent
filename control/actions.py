@@ -18,7 +18,17 @@ ACTION_MAP = {
     7: "dash_back",  # Evasive Back (S + Q)
     8: "dash_left",  # Evasive Left (A + Q)
     9: "dash_right",  # Evasive Right (D + Q)
-    10: "dash_forward"  # Forward (not evasive) (W + Q)
+    10: "dash_forward",  # Forward (not evasive) (W + Q)
+    11: "1",
+    12: "2",
+    13: "3",
+    14: "4",
+    15: "r",
+    16: "r_2",
+    17: "g",
+    18: "click",
+    19: "look_up",
+    20: "look_down"
 }
 
 def get_action_name(action_id):

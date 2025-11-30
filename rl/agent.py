@@ -70,14 +70,14 @@ class PPOAgent:
         old_actions = torch.stack([torch.tensor(a).to(self.device) for a in memory.actions]).detach()
         old_logprobs = torch.stack([torch.tensor(l).to(self.device) for l in memory.logprobs]).detach()
         
-        # For update, we might need to handle LSTM states carefully.
-        # Simple approach: Reset hidden state for batch update (treat as independent sequences or use stored hidden states)
-        # Ideally, we store hidden states in memory too.
-        # For now, we'll start with zero hidden state for the batch update (Approximation)
+        # For update, we process the entire memory as a single sequence (Batch=1, Seq=N)
+        # This allows the LSTM to learn temporal dependencies over the full trajectory.
+        seq_len = len(memory.states)
         
         for _ in range(self.k_epochs):
-            # Forward pass with fresh hidden state
-            probs, state_values, _ = self.policy(full_batch, crop_batch, flow_batch)
+            # Forward pass with fresh hidden state (or we could try to preserve it, but fresh is safer for stability)
+            # We pass seq_len to tell the network to reshape inputs
+            probs, state_values, _ = self.policy(full_batch, crop_batch, flow_batch, seq_len=seq_len)
             
             dist = torch.distributions.Categorical(probs)
             

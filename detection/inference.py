@@ -10,7 +10,7 @@ import os
 # --- Configuration ---
 MODEL_PATH = r"T:\Auto-Farmer-Data\runs\combined_training_p3\weights\best.pt" # Updated to combined model
 INPUT_SIZE = 640
-CONF_THRESHOLD = 0.50
+CONF_THRESHOLD = 0.35
 IOU_THRESHOLD = 0.45
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 HALF_PRECISION = True if DEVICE == 'cuda' else False
@@ -60,6 +60,8 @@ class Perception:
         # Global Motion & Smoothing
         self.smoothed_boxes = {} # ID -> xywh (smoothed)
         self.prev_gray = None
+        self.prev_gray_full = None # For motion mask
+        self.motion_mask = None
         self.prev_pts = None # For KLT tracking
         self.global_motion_history = deque(maxlen=30) # Store (dx, dy) per frame
         
@@ -152,6 +154,7 @@ class Perception:
         self.brightness_history = defaultdict(lambda: deque(maxlen=5))
         self.ragdoll_counters = defaultdict(int)
         self.last_player_health = 1.0
+        self.filtered_health = 1.0
 
         # --- Optimization & Advanced Hit Detection ---
         self.detection_interval = 4 # Run YOLO every 4 frames
@@ -441,7 +444,34 @@ class Perception:
         self.prev_gray = small_gray
         return dx, dy
 
-    def detect(self, frame):
+    def generate_motion_mask(self, current_gray, prev_gray, dx, dy):
+        """
+        Generates a motion mask by compensating for camera motion.
+        dx, dy: Camera motion (pixel displacement).
+        """
+        rows, cols = current_gray.shape
+        
+        # Create transformation matrix for translation
+        # We shift prev by -dx, -dy to align with current
+        M = np.array([[1, 0, -dx], [0, 1, -dy]], dtype=np.float32)
+        
+        # Warp previous frame to align with current
+        warped_prev = cv2.warpAffine(prev_gray, M, (cols, rows))
+        
+        # Calculate difference
+        diff = cv2.absdiff(current_gray, warped_prev)
+        
+        # Threshold
+        _, mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+        
+        # Morphological operations to clean up noise
+        kernel = np.ones((3,3), np.uint8)
+        mask = cv2.erode(mask, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+        
+        return mask
+
+    def detect(self, frame, mouse_movement=(0,0)):
         """
         Optimized Detection Pipeline:
         1. Global Motion Estimation
@@ -464,9 +494,21 @@ class Perception:
         g_dx, g_dy = self._estimate_global_motion(gray)
         self.global_motion_history.append((g_dx, g_dy))
         
+        # Motion Mask Generation
+        if self.prev_gray_full is not None:
+            self.motion_mask = self.generate_motion_mask(gray, self.prev_gray_full, g_dx, g_dy)
+        else:
+            self.motion_mask = np.zeros_like(gray)
+        self.prev_gray_full = gray.copy()
+        
         # Motion Blur Protection: Skip YOLO if camera is spinning too fast
         # This prevents false positives from motion blur
-        is_stable = abs(g_dx) < 30.0 and abs(g_dy) < 30.0
+        # Check Mouse Input: If mouse is moving but flow is 0, flow failed -> Unstable
+        m_dx, m_dy = mouse_movement
+        flow_failed = (abs(m_dx) > 5 or abs(m_dy) > 5) and (abs(g_dx) < 1.0 and abs(g_dy) < 1.0)
+        
+        # Drastically increased speed limit to allow detection during turns
+        is_stable = (abs(g_dx) < 300.0 and abs(g_dy) < 300.0) and not flow_failed
 
         # Decide: Run YOLO or Track?
         run_yolo = (self.frame_count % self.detection_interval == 0) and is_stable
@@ -489,8 +531,24 @@ class Perception:
                     conf = float(box.conf[0])
                     xywh = box.xywh[0].cpu().numpy()
                     
-                    # Update/Create Tracker
+                    # Motion Validation
+                    # Check if the box contains motion
                     x, y, w, h = xywh
+                    x1, y1 = int(max(0, x - w/2)), int(max(0, y - h/2))
+                    x2, y2 = int(min(INPUT_SIZE, x + w/2)), int(min(INPUT_SIZE, y + h/2))
+                    
+                    motion_score = 0.0
+                    if self.motion_mask is not None:
+                        roi_motion = self.motion_mask[y1:y2, x1:x2]
+                        if roi_motion.size > 0:
+                            motion_score = cv2.countNonZero(roi_motion) / roi_motion.size
+                    
+                    # Filter: If confidence is low (< 0.5) AND motion is low (< 0.05), discard
+                    # This allows keeping low-conf moving objects, but rejecting low-conf static ones
+                    if conf < 0.5 and motion_score < 0.05:
+                        continue
+                    
+                    # Update/Create Tracker
                     tl_x, tl_y = x - w/2, y - h/2
                     bbox = (tl_x, tl_y, w, h)
                     
@@ -532,7 +590,7 @@ class Perception:
                 if tracker:
                     success, bbox = tracker.update(img)
                 
-                if success:
+                if success and bbox is not None:
                     tl_x, tl_y, w, h = bbox
                     cx = tl_x + w/2
                     cy = tl_y + h/2
@@ -547,10 +605,25 @@ class Perception:
                     cx += g_dx
                     cy += g_dy
                     
+                    # Check Motion Mask at predicted location
+                    # If there is motion there, maybe we can keep it alive longer?
+                    motion_score = 0.0
+                    if self.motion_mask is not None:
+                        x1, y1 = int(max(0, cx - w/2)), int(max(0, cy - h/2))
+                        x2, y2 = int(min(INPUT_SIZE, cx + w/2)), int(min(INPUT_SIZE, cy + h/2))
+                        roi_motion = self.motion_mask[y1:y2, x1:x2]
+                        if roi_motion.size > 0:
+                            motion_score = cv2.countNonZero(roi_motion) / roi_motion.size
+                    
                     if 0 <= cx <= INPUT_SIZE and 0 <= cy <= INPUT_SIZE:
                         xywh = np.array([cx, cy, w, h])
                         state['box'] = xywh
                         state['failures'] += 1
+                        
+                        # If moving, be more lenient with failures
+                        if motion_score > 0.1:
+                            state['failures'] = max(0, state['failures'] - 0.5) # Reduce failure count
+                            
                         current_objects[tid] = xywh
                     else:
                         state['failures'] += 10
@@ -613,7 +686,15 @@ class Perception:
                 player_candidate = (tid, xywh, conf)
         
         # Health Logic
-        current_health = self.get_health(frame)
+        raw_health = self.get_health(frame)
+        
+        # Hysteresis: If health jumps to 1.0 from [0.1, 0.8], ignore it (assume false positive/UI glitch)
+        if raw_health > 0.95 and 0.1 <= self.filtered_health <= 0.8:
+             current_health = self.filtered_health
+        else:
+             current_health = raw_health
+             self.filtered_health = current_health
+
         det_dict["health"] = current_health
         p_damage_visual = 1.0 if (current_health < self.last_player_health - 0.005) else 0.0
         self.last_player_health = current_health
@@ -1186,7 +1267,7 @@ class Perception:
         
         return vx, vy
 
-    def get_obs(self, frame, last_action=None):
+    def get_obs(self, frame, last_action=None, mouse_movement=(0,0)):
         """
         Main function to get observation vector from frame.
         Returns np.array of shape (20,)
@@ -1198,7 +1279,7 @@ class Perception:
         if self.frame_count % 60 == 0:
             self.scan_ui(frame)
         
-        det_dict = self.detect(frame)
+        det_dict = self.detect(frame, mouse_movement)
         self.last_det = det_dict # Save for visualization
         
         # Extract Player
@@ -1236,11 +1317,11 @@ class Perception:
         enemy_dx, enemy_dy = 1.0, 1.0 # Default: Far away
         enemy_flash = 0.0
         found_enemy = False
+        best_enemy = None # Initialize best_enemy
         
         if det_dict["enemies"]:
             # Find nearest to player (cx, cy)
             best_dist = float('inf')
-            best_enemy = None
             
             for item in det_dict["enemies"]:
                 # Handle variable tuple lengths
@@ -1302,9 +1383,19 @@ class Perception:
         # Cooldowns
         cooldowns = self.detect_cooldowns(frame)
         
+        # Calculate Relative Size (Enemy Area / Player Area)
+        relative_size = 0.0
+        if player is not None and found_enemy and best_enemy is not None:
+            # player: (cx, cy, w, h, ...)
+            # best_enemy: (x, y, w, h, ...)
+            p_area = player[2] * player[3]
+            e_area = best_enemy[2] * best_enemy[3]
+            if p_area > 0:
+                relative_size = e_area / p_area
+        
         # Build Vector
         # [px, py, vx, vy, edx, edy, odx, ody, dist_goal, time_since_seen, health, 
-        #  enemy_health, mode, evasive, special, is_ragdolled, cd1, cd2, cd3, cd4]
+        #  enemy_flash, mode, evasive, special, p_ragdoll, cd1, cd2, cd3, cd4, relative_size]
         
         # MAPPING UPDATE:
         # health -> health (Back to healthbar)
@@ -1326,7 +1417,8 @@ class Perception:
             evasive_lvl,
             special_lvl,
             p_ragdoll,     # Was is_ragdolled (logic updated)
-            cooldowns[0], cooldowns[1], cooldowns[2], cooldowns[3]
+            cooldowns[0], cooldowns[1], cooldowns[2], cooldowns[3],
+            relative_size
         ], dtype=np.float32)
         
         # Sanity check / Clip

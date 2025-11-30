@@ -248,8 +248,9 @@ def main():
     perception = init_perception(yolo_model_path)
     
     print("Initializing Agent...")
-    # Action Dim = 11 (Movement Only)
-    agent = PPOAgent(action_dim=11)
+    # Action Dim = 19 (Movement + Moves 1-4 + R + R_2 + G + Click)
+    # Excludes look_up (19) and look_down (20) which are for Direct Policy only
+    agent = PPOAgent(action_dim=19)
     
     # Load existing model
     model_path = "ppo_agent_pixel.pth" # Changed name to avoid conflict
@@ -307,8 +308,11 @@ def main():
                 continue
                 
             # 2. Perception
+            # Get mouse movement
+            mdx, mdy = controller.get_recent_movement()
+            
             # Get Vector Obs (for Reward) - This runs detection
-            vector_obs = perception.get_obs(frame, last_action=current_action)
+            vector_obs = perception.get_obs(frame, last_action=current_action, mouse_movement=(mdx, mdy))
             
             # Get Pixel Obs (for Agent) - This uses cached detection
             pixel_obs = perception.get_pixel_obs(frame)

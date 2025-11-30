@@ -99,50 +99,41 @@ class TwoStreamNetwork(nn.Module):
                 elif 'bias' in name:
                     param.data.fill_(0.0)
         
-    def forward(self, full_frames, crop_frames, flow, hidden_state=None):
+    def forward(self, full_frames, crop_frames, flow, hidden_state=None, seq_len=1):
         """
-        full_frames: [Batch, Seq, C, H, W] or [Batch, C_stack, H, W]
-        If input is [Batch, C_stack, H, W], we treat it as Seq=1
+        full_frames: [Batch*Seq, C, H, W]
+        seq_len: Length of sequence (default 1 for inference)
         """
-        # Assuming inputs are [Batch, Channels, H, W] for a single step
-        # MobileNet expects [Batch, Channels, H, W]
-        
         # 1. Encode Full Frames
-        # MobileNetV3 features returns [Batch, 576, 1, 1] roughly before pooling?
-        # The .features part returns spatial map. We need to pool it.
-        # Actually, we replaced classifier with Identity, but MobileNetV3 structure is:
-        # features -> avgpool -> classifier.
-        # So we need to call features then avgpool.
-        
         x_full = self.full_encoder.features(full_frames)
         x_full = self.full_encoder.avgpool(x_full)
-        x_full = torch.flatten(x_full, 1) # [Batch, 576]
+        x_full = torch.flatten(x_full, 1) # [Batch*Seq, 576]
         
         # 2. Encode Crop
-        x_crop = self.crop_encoder(crop_frames) # [Batch, 128]
+        x_crop = self.crop_encoder(crop_frames) # [Batch*Seq, 128]
         
         # 3. Encode Flow
-        x_flow = self.flow_encoder(flow) # [Batch, 32]
+        x_flow = self.flow_encoder(flow) # [Batch*Seq, 32]
         
         # 4. Fusion
-        fusion = torch.cat([x_full, x_crop, x_flow], dim=1) # [Batch, Fusion_Dim]
+        fusion = torch.cat([x_full, x_crop, x_flow], dim=1) # [Batch*Seq, Fusion_Dim]
         
         # Project
-        fusion_proj = self.fusion_layer(fusion)
+        fusion_proj = self.fusion_layer(fusion) # [Batch*Seq, 256]
         
         # 5. LSTM
-        # LSTM expects [Batch, Seq, Features]
-        # We add Sequence dimension
-        fusion_seq = fusion_proj.unsqueeze(1) 
+        # Reshape to [Batch, Seq, Features]
+        batch_size = fusion_proj.size(0) // seq_len
+        fusion_seq = fusion_proj.view(batch_size, seq_len, -1)
         
-        lstm_out, new_hidden = self.lstm(fusion_seq, hidden_state)
-        
-        # Take last output for heads
-        last_out = lstm_out[:, -1, :]
+        lstm_out, new_hidden = self.lstm(fusion_seq, hidden_state) # [Batch, Seq, 128]
         
         # 6. Heads
-        action_probs = self.actor(last_out)
-        value = self.critic(last_out)
+        # Flatten back to [Batch*Seq, 128] for heads
+        lstm_out_flat = lstm_out.reshape(-1, 128)
+        
+        action_probs = self.actor(lstm_out_flat)
+        value = self.critic(lstm_out_flat)
         
         return action_probs, value, new_hidden
 
