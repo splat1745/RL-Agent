@@ -91,6 +91,11 @@ class InputController:
         self.recent_mouse_dy = 0
         self._lock = threading.Lock()
 
+        # Cooldown Management
+        self.last_used = {}
+        # Removed hardcoded cooldowns to rely on visual detection
+        self.cooldowns = {}
+
     def move_mouse_constrained(self, dx, dy):
         """
         Moves mouse with vertical constraint.
@@ -134,6 +139,19 @@ class InputController:
         return dx, dy
 
     def execute(self, action_name, duration=0.1):
+        # Cooldown Check
+        check_name = action_name
+        if action_name == "r_2": check_name = "2" # Share cooldown key
+        if action_name == "2": check_name = "2"
+        
+        if check_name in self.cooldowns:
+            last = self.last_used.get(check_name, 0)
+            if time.time() - last < self.cooldowns[check_name]:
+                # On Cooldown - Ignore
+                return
+            # Mark as used
+            self.last_used[check_name] = time.time()
+
         # Release previous key if different (and not a combo/instant)
         if self.current_key and self.current_key != action_name:
             self._release(self.current_key)
@@ -148,55 +166,92 @@ class InputController:
             time.sleep(duration)
             return
             
+        if action_name == "m1_3": # 3x M1 (Replaces Click)
+            click()
+            time.sleep(0.1)
+            click()
+            time.sleep(0.1)
+            click()
+            time.sleep(duration)
+            return
+
+        if action_name == "reg_m4": # 4x M1
+            for _ in range(4):
+                click()
+                time.sleep(0.1)
+            time.sleep(duration)
+            return
+
+        if action_name == "down_m1": # 3x M1 + Space + M1
+            # 3x M1
+            for _ in range(3):
+                click()
+                time.sleep(0.1)
+            # Space
+            press_key(DIK_SPACE)
+            time.sleep(0.05)
+            release_key(DIK_SPACE)
+            time.sleep(0.1)
+            # M1
+            click()
+            time.sleep(duration)
+            return
+
+        if action_name == "up_m1": # 3x M1 + Hold Space + M1
+            # 3x M1
+            for _ in range(3):
+                click()
+                time.sleep(0.1)
+            # Hold Space
+            press_key(DIK_SPACE)
+            time.sleep(0.1)
+            # M1
+            click()
+            time.sleep(0.1)
+            # Release Space
+            release_key(DIK_SPACE)
+            time.sleep(duration)
+            return
+
         # Evasive Actions (Q + Direction)
         if action_name == "dash_left":
-            # Hold A, Tap Q
             press_key(DIK_A)
-            time.sleep(0.05)
             press_key(DIK_Q)
             time.sleep(0.05)
             release_key(DIK_Q)
-            time.sleep(duration)
             release_key(DIK_A)
+            time.sleep(duration)
             return
 
         if action_name == "dash_right":
-            # Hold D, Tap Q
             press_key(DIK_D)
-            time.sleep(0.05)
             press_key(DIK_Q)
             time.sleep(0.05)
             release_key(DIK_Q)
-            time.sleep(duration)
             release_key(DIK_D)
+            time.sleep(duration)
             return
 
         if action_name == "dash_back":
-            # Hold S, Tap Q
             press_key(DIK_S)
-            time.sleep(0.05)
             press_key(DIK_Q)
             time.sleep(0.05)
             release_key(DIK_Q)
-            time.sleep(duration)
             release_key(DIK_S)
+            time.sleep(duration)
+            return
+
+        if action_name == "dash_forward":
+            press_key(DIK_W)
+            press_key(DIK_Q)
+            time.sleep(0.05)
+            release_key(DIK_Q)
+            release_key(DIK_W)
+            time.sleep(duration)
             return
 
         # Combos
-        if action_name == "r_1":
-            # R + 1: Press 1, then Spam R
-            self._press("1")
-            time.sleep(0.05)
-            self._release("1")
-            time.sleep(0.05)
-            # Spam R
-            for _ in range(3):
-                press_key(DIK_R)
-                time.sleep(0.03)
-                release_key(DIK_R)
-                time.sleep(0.03)
-            time.sleep(duration)
-            return
+        # r_1 removed
 
         if action_name == "r_2":
             # R + 2: Press R, then 2
@@ -210,7 +265,16 @@ class InputController:
             time.sleep(duration)
             return
 
-        if action_name in ["w", "a", "s", "d", "q", "f", "r", "g", "1", "2", "3", "4"]:
+        # Explicit Tap for Skills (1-4, F, R, G)
+        if action_name in ["1", "2", "3", "4", "f", "r", "g"]:
+            self._press(action_name)
+            time.sleep(0.05) # Short press
+            self._release(action_name)
+            time.sleep(duration)
+            return
+
+        # Hold for Movement (WASD)
+        if action_name in ["w", "a", "s", "d", "q"]:
             self._press(action_name)
             self.current_key = action_name
             time.sleep(duration) # Hold the key
@@ -218,27 +282,55 @@ class InputController:
         elif action_name == "turn_left":
             # Move mouse in chunks to simulate smooth turning over duration
             steps = int(duration / 0.02)
+            if steps < 1: steps = 1
             for _ in range(steps):
                 self.move_mouse_constrained(-35, 0) # Increased speed for responsiveness
                 time.sleep(0.01)
                 
         elif action_name == "turn_right":
             steps = int(duration / 0.02)
+            if steps < 1: steps = 1
             for _ in range(steps):
                 self.move_mouse_constrained(35, 0) # Increased speed for responsiveness
                 time.sleep(0.01)
 
-        elif action_name == "look_up":
+        elif action_name == "turn_left_micro":
+            self.move_mouse_constrained(-5, 0)
+            time.sleep(duration)
+
+        elif action_name == "turn_right_micro":
+            self.move_mouse_constrained(5, 0)
+            time.sleep(duration)
+
+        elif action_name == "turn_left_small":
             steps = int(duration / 0.02)
+            if steps < 1: steps = 1
             for _ in range(steps):
-                self.move_mouse_constrained(0, -3) # Slight vertical movement
+                self.move_mouse_constrained(-10, 0) # Total ~20-30 depending on duration
                 time.sleep(0.01)
 
-        elif action_name == "look_down":
+        elif action_name == "turn_right_small":
             steps = int(duration / 0.02)
+            if steps < 1: steps = 1
             for _ in range(steps):
-                self.move_mouse_constrained(0, 3) # Slight vertical movement
+                self.move_mouse_constrained(10, 0)
                 time.sleep(0.01)
+
+        elif action_name == "turn_left_large":
+            steps = int(duration / 0.02)
+            if steps < 1: steps = 1
+            for _ in range(steps):
+                self.move_mouse_constrained(-35, 0)
+                time.sleep(0.01)
+
+        elif action_name == "turn_right_large":
+            steps = int(duration / 0.02)
+            if steps < 1: steps = 1
+            for _ in range(steps):
+                self.move_mouse_constrained(35, 0)
+                time.sleep(0.01)
+
+        # Removed look_up and look_down from RL control
 
     def _press(self, key):
         if key == "w": press_key(DIK_W)

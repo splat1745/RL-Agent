@@ -3,12 +3,10 @@ import time
 
 def calculate_reward(obs, action_idx, state_manager):
     """
-    Calculates reward based on simplified logic:
-    1. Get closer to enemy
-    2. Hit enemy (Flash)
-    3. Avoid damage (Health drop)
+    Calculates reward based on strict spatial and temporal logic.
+    Enforces "No Random Moves" policy and "Damage Reflection".
     """
-    # obs: [px, py, vx, vy, edx, edy, odx, ody, dist_goal, time_since_seen, health, enemy_flash, ...]
+    # obs: [px, py, vx, vy, edx, edy, odx, ody, dist_goal, time_since_seen, health, enemy_flash, ..., relative_size, is_overlapping, leaks_above]
     
     current_health = 1.0
     enemy_flash = 0.0
@@ -18,18 +16,15 @@ def calculate_reward(obs, action_idx, state_manager):
         enemy_flash = obs[11]
         
     # Get deltas from state manager
-    # delta_enemy = dist_current - dist_prev
     delta_enemy, _ = state_manager.get_deltas(obs)
     
     reward = 0.0
     
     # 1. Distance Reward (Chase)
     # Reward getting closer (negative delta)
-    # Increased weight to encourage aggressive chasing
     reward += -delta_enemy * 2.0
     
     # Proximity Penalty (Stay within range)
-    # obs[4], obs[5] are edx, edy (normalized)
     dist = 1.0
     if len(obs) > 5:
         edx, edy = obs[4], obs[5]
@@ -40,123 +35,155 @@ def calculate_reward(obs, action_idx, state_manager):
             reward -= 0.1
             
         # Target Lock Reward: Encourage keeping enemy in center
-        # Boosted to strongly encourage facing the enemy
-        # Max +0.5 when centered
-        reward += max(0, (0.5 - dist) * 1.0)
+        # "reward more through aiming moves"
+        # Increased weight from 1.0 to 2.0
+        reward += max(0, (0.5 - dist) * 2.0)
 
         # Action Penalty: Don't look away or retreat if you have the target!
-        # If enemy is visible (dist < 1.0 implies we have a valid coordinate, usually)
-        # And enemy is reasonably centered (dist < 0.4)
         if dist < 0.4:
-            # 5: Turn Left, 6: Turn Right
-            if action_idx in [5, 6]:
-                reward -= 0.5 # Penalty for turning away when locked on
-            
+            # 5: Turn Left, 6: Turn Right, 22: Slow Left, 23: Slow Right
+            if action_idx in [5, 6, 22, 23]:
+                reward -= 0.5 
             # 3: S, 7: Dash Back
             if action_idx in [3, 7]:
-                reward -= 0.5 # Penalty for retreating
-            
+                reward -= 0.5 
             # 7: Dash Back, 8: Dash Left, 9: Dash Right
             if action_idx in [7, 8, 9]:
-                reward -= 0.2 # Slight penalty for dashing when locked on (unless dodging, but we don't know that yet)
-
-        # --- Move Usage Rewards ---
-        # Center Constraint: Only reward moves if enemy is within 3% of center (dist < 0.03)
-        # 3% of screen width (normalized -1 to 1) is 0.06 range, so dist < 0.03
-        is_centered = dist < 0.03
-        
-        # Move 1 (Tracking) & Move 2 (Projectile): Reward if enemy is visible
-        # "Using move 1 and move 2 while enemy bounding box is small = small reward"
-        # relative_size is at index 20
-        relative_size = 0.0
-        if len(obs) > 20:
-            relative_size = obs[20]
-
-        if action_idx in [11, 12]: # "1", "2"
-            if is_centered and relative_size > 0: # Enemy visible and centered
-                if relative_size < 0.3: # Far away / Small
-                    reward += 0.2 # Small reward for using ranged moves at range
-                else:
-                    reward += 0.1 # Smaller reward if close (maybe should be penalty? User didn't specify)
-            else:
-                reward -= 0.1 # Wasted move (not centered or no enemy)
-            
-        # Moves 3 & 4 (Close Up): Reward if enemy is close (Relative Size check)
-        if action_idx in [13, 14]: # "3", "4"
-            # "Using move 3 or 4 while enemy is far = -reward while when enemy close = +reward"
-            if is_centered and relative_size >= 0.7: # Close and Centered
-                reward += 1.0 # Big reward for correct usage
-            elif relative_size > 0: # Visible but far
-                reward -= 0.5 # Penalty for using close-up move when far
-            else:
-                reward -= 0.5 # Wasted move
-
-        # Mode Usage (G): Reward if health is low
-        if action_idx == 17: # "g"
-            if current_health < 0.4:
-                reward += 2.0 # Big reward for using mode when low health
-            else:
-                reward -= 0.5 # Penalty for wasting mode when healthy
+                reward -= 0.2 
                 
-        # M1 Usage (Click)
-        if action_idx == 18: # "click"
-            # "When doing at least 3 concecutive m1s and no health is lost, then assume he hit them"
-            # We check if this is the 3rd (or more) consecutive click
-            if state_manager.consecutive_m1_count >= 3:
-                # Check if health lost in this frame (simple check)
-                # Ideally we check over the duration of the clicks, but "no health lost" usually implies "didn't get hit back immediately"
-                if current_health >= state_manager.prev_health:
-                    reward += 0.5 # Reward for sustained combo without taking damage
+    # --- BLOCK SUCCESS LOGIC ---
+    # "implement a method of figuring out if the block was successful or not"
+    # Logic: Action is Block (18) AND Enemy is Attacking (enemy_flash > 0.1) AND No Health Loss
+    if action_idx == 18: # Block
+        if enemy_flash > 0.1: # Enemy is attacking
+            # Check if health was lost in this step (approx)
+            # state_manager.prev_health is from previous step
+            damage_taken = 0.0
+            if state_manager.prev_health is not None:
+                damage_taken = max(0.0, state_manager.prev_health - current_health)
             
-            # Basic M1 reward if close and centered
-            if is_centered and relative_size > 0.5:
-                reward += 0.1
+            if damage_taken < 0.001:
+                # Successful Block!
+                reward += 2.0
+            else:
+                # Failed Block (Chip damage or broken guard)
+                reward += 0.1 # Still better than taking full damage?
+        else:
+            # Blocking for no reason
+            reward -= 0.1
 
-    # Delayed Safety Reward (Dash/Moves)
-    # "if no health is lost after 1.6 seconds then assume a positive reward"
+    # --- STRICT DELAYED REWARD LOGIC ---
+    # "CANNOT do random moves and get rewarded UNLESS..."
+    # 1. Enemy bounding box leaks above player (leaks_above > 0.5)
+    # 2. Is in front of player (is_overlapping > 0.5 covers touching/in-front)
+    # 3. Is in center of screen (dist < 0.1)
+    # 4. Doesn't get damaged 1.618 seconds after doing move (Golden Ratio Delay)
+    
     now = time.time()
-    for act, ts, hp in state_manager.action_history:
-        # Check if action was ~1.6s ago (1.5 to 1.7 window)
-        if 1.5 < (now - ts) < 1.7:
-            # Check if health has dropped since then
-            # We compare current_health to hp (health at time of action)
-            # Allow small float error
-            if current_health >= hp - 0.001:
-                # It was a safe move!
-                # Give reward based on action type
-                if act == 10: # Dash Forward
-                    reward += 0.5
-                elif act in [7, 8, 9]: # Evasive Dashes
-                    reward += 0.5
-                elif act in [11, 12, 13, 14, 18]: # Attacks
-                    reward += 0.2 # Safe attack
+    for act, ts, past_obs in state_manager.action_history:
+        # Check if action was ~1.618s ago (1.55 to 1.7 window)
+        if 1.55 < (now - ts) < 1.7:
+            # Only check for Moves (1-4), M1 (19), and Combos (15)
+            if act in [11, 12, 13, 14, 19, 15]:
+                
+                # Condition 4: No damage taken since then (Improved Hit Detection)
+                # Check if any hit occurred in the window [ts, now]
+                was_hit = state_manager.was_hit_in_window(ts, now)
+                
+                if not was_hit:
+                    # Check Past Context
+                    p_edx, p_edy = past_obs[4], past_obs[5]
+                    p_dist = np.sqrt(p_edx*p_edx + p_edy*p_edy)
+                    
+                    p_is_overlapping = 0.0
+                    p_leaks_above = 0.0
+                    if len(past_obs) > 21:
+                        p_is_overlapping = past_obs[21]
+                    if len(past_obs) > 22:
+                        p_leaks_above = past_obs[22]
+                    
+                    # Conditions 1, 2, 3
+                    # Center (< 0.1), Overlapping (> 0.5), Leaks Above (> 0.5)
+                    if p_dist < 0.1 and p_is_overlapping > 0.5 and p_leaks_above > 0.5:
+                        # SUCCESS!
+                        # "reward more for successful attacks"
+                        reward += 3.0 # Increased from 2.0
+                        
+                        # Bonus for specific moves if needed
+                        if act in [13, 14, 15, 19]: # Close range moves / Combos
+                            reward += 1.5
+                    else:
+                        # Failed spatial conditions -> Penalty for wasting move
+                        reward -= 0.5
+                else:
+                    # Failed safety condition -> Penalty for unsafe move (Got hit during/after move)
+                    reward -= 1.0
+
+    # --- CONSECUTIVE M1 REWARD ---
+    # Reward chaining M1s (19)
+    if action_idx == 19:
+        if state_manager.consecutive_m1_count > 0:
+            reward += 0.1 * min(5, state_manager.consecutive_m1_count) # Small bonus for chaining
+    
+    # --- REFLECTIVE LEARNING: DAMAGE ANALYSIS ---
+    # "Whenever the agent takes damage, it reflects off of the raw video from 3 seconds ago"
+    # UPDATED: "reduce trama memory down to 4 seconds but allow overlapping"
+    if state_manager.prev_health is not None:
+        if current_health < state_manager.prev_health - 0.001:
+            # Damage Taken!
+            reward -= 1.0 # Immediate penalty
+            
+            # Reflect on last 4 seconds
+            reflection_window = 4.0
+            
+            for act, ts, past_obs in state_manager.action_history:
+                if now - ts <= reflection_window:
+                    # Penalize Passivity
+                    if act == 0: # Idle
+                        reward -= 0.2 # Don't just stand there!
+                    elif act in [1, 2, 3, 4]: # Walking
+                        reward -= 0.1 # Walking is better than idle, but maybe dash?
+                    
+                    # Penalize Unsafe Attacks (Trading)
+                    if act in [11, 12, 13, 14, 19, 15]:
+                        reward -= 0.1 # You attacked but got hit. Be careful.
+                    
+                    # Innovation: Penalize "Blindness"
+                    # If we got hit and weren't looking at the enemy
+                    p_edx, p_edy = past_obs[4], past_obs[5]
+                    p_dist = np.sqrt(p_edx*p_edx + p_edy*p_edy)
+                    if p_dist > 0.5:
+                        reward -= 0.2 # You got hit because you weren't looking!
+
+    # Mode Usage (G): Reward if health is low (Immediate is fine for utility)
+    if action_idx == 16: # "g"
+        # "Dont reward pressing G unless health was gained... only if health is between 70% and 30%"
+        if 0.3 <= current_health <= 0.7:
+             # Check if health increased
+             if state_manager.prev_health is not None and current_health > state_manager.prev_health + 0.01:
+                 reward += 2.0
+             else:
+                 # Penalize using it if no health gained (cooldown or full hp or interrupted)
+                 reward -= 0.1 
+        else:
+            # Outside range
+            reward -= 0.5 
 
     # Lost Target / Visibility Penalty
-    # obs[9] is time_since_seen_norm (0..1)
     if len(obs) > 9:
         time_since_seen = obs[9]
-        
-        # Immediate penalty for not seeing enemy this frame
-        # time_since_seen is normalized. If > 0 (approx), it means we didn't see it this frame.
-        # Using a small epsilon because of float precision/execution time
         if time_since_seen > 0.01:
-            reward -= 0.1 # Constant pressure to find enemy
-            
-        # Heavy penalty if lost for longer (> 0.25s)
+            reward -= 0.1 
         if time_since_seen > 0.05:
             reward -= 0.5
-    
-    # 2. Attack Reward (Hit) - REMOVED
-    # if enemy_flash > 0.1:
-    #    reward += 2.0
-        
-    # 3. Damage Penalty (Get Hit)
-    if state_manager.prev_health is not None:
-        # Use a small threshold to avoid float noise, though health is usually discrete-ish
-        if current_health < state_manager.prev_health - 0.001:
-            reward -= 2.0
+            
+    # Rapid Action Switching Penalty
+    if len(state_manager.action_history) > 0:
+        last_action_idx = state_manager.action_history[-1][0]
+        if action_idx != last_action_idx:
+            reward -= 0.05
 
-     # add constant penalty to always encourage improvement
+    # Constant penalty
     reward -= 0.01       
     state_manager.update(obs, action_idx)
     

@@ -99,3 +99,21 @@ class DirectPolicy:
             return 3 # S (Back)
             
         return 0 # Idle if in sweet spot
+
+    @staticmethod
+    def calculate_aim_assist(vector_obs, gain=300.0):
+        """
+        Calculates mouse movement (dx, dy) to lock onto target.
+        """
+        if len(vector_obs) < 10: return 0, 0
+        
+        edx = vector_obs[4]
+        edy = vector_obs[5]
+        time_since_seen = vector_obs[9]
+        
+        if time_since_seen < 0.1:
+            move_x = int(edx * gain)
+            move_y = int(edy * gain * 0.5)
+            return move_x, move_y
+        return 0, 0
+

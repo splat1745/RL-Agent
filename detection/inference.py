@@ -6,11 +6,12 @@ from ultralytics import YOLO
 from collections import deque, defaultdict
 import json
 import os
+import traceback
 
 # --- Configuration ---
 MODEL_PATH = r"T:\Auto-Farmer-Data\runs\combined_training_p3\weights\best.pt" # Updated to combined model
 INPUT_SIZE = 640
-CONF_THRESHOLD = 0.35
+CONF_THRESHOLD = 0.20 # Lowered from 0.25
 IOU_THRESHOLD = 0.45
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 HALF_PRECISION = True if DEVICE == 'cuda' else False
@@ -145,10 +146,43 @@ class Perception:
         self.skip_frames = 0 # Dynamic frame skipping
         self.fps_log = []
         
+        # --- Depth Estimation ---
+        self.depth_model = None
+        self.depth_transform = None
+        try:
+            print("Loading MiDaS Small for Depth Estimation...")
+            
+            # SSL Certificate Fix for Windows
+            import ssl
+            try:
+                _create_unverified_https_context = ssl._create_unverified_context
+            except AttributeError:
+                pass
+            else:
+                ssl._create_default_https_context = _create_unverified_https_context
+            
+            # Check for timm
+            try:
+                import timm
+            except ImportError:
+                print("Warning: 'timm' library not found. Installing it is recommended for MiDaS: pip install timm")
+
+            self.depth_model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", trust_repo=True)
+            self.depth_model.to(self.device)
+            self.depth_model.eval()
+            
+            midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
+            self.depth_transform = midas_transforms.small_transform
+            print("MiDaS Loaded.")
+        except Exception as e:
+            print(f"Error loading MiDaS: {e}. Depth estimation disabled.")
+            traceback.print_exc()
+
         # --- Pixel-Based State ---
         self.frame_stack = deque(maxlen=4) # Stores last 4 frames (160x160)
         self.crop_stack = deque(maxlen=4)  # Stores last 4 crops (96x96)
         self.last_gray = None # For optical flow
+        self.last_depth_vis = None # For visualization
         
         # --- New Logic State ---
         self.brightness_history = defaultdict(lambda: deque(maxlen=5))
@@ -510,6 +544,32 @@ class Perception:
         # Drastically increased speed limit to allow detection during turns
         is_stable = (abs(g_dx) < 300.0 and abs(g_dy) < 300.0) and not flow_failed
 
+        # --- HIT DETECTION VIA SHAKE (User Request) ---
+        # "subtracting mouse movement to compare background movement"
+        # We assume Background Flow (g_dx, g_dy) is roughly proportional to Mouse (m_dx, m_dy)
+        # Usually Mouse Move Right -> Camera Pans Right -> Background Moves Left (Negative Flow)
+        # So Flow ~ -Mouse * Sensitivity. 
+        # We use a heuristic sensitivity of 1.5 (pixels flow per pixel mouse) based on typical sensitivity.
+        sensitivity = 1.5
+        expected_dx = -m_dx * sensitivity
+        expected_dy = -m_dy * sensitivity
+        
+        residual_dx = g_dx - expected_dx
+        residual_dy = g_dy - expected_dy
+        
+        shake_magnitude = np.sqrt(residual_dx**2 + residual_dy**2)
+        
+        # If shake is high, it might be a hit (Camera Shake effect)
+        # We only count it if the residual is significantly larger than the expected motion (Signal to Noise)
+        is_shake_hit = 0.0
+        if shake_magnitude > 10.0: # Threshold for significant shake
+             # Further filter: If mouse is moving fast, residual might just be sensitivity mismatch.
+             # So we trust shake more when mouse is slow.
+             if abs(m_dx) < 5 and abs(m_dy) < 5:
+                 is_shake_hit = 1.0
+             elif shake_magnitude > 30.0: # Huge shake even with mouse movement
+                 is_shake_hit = 1.0
+
         # Decide: Run YOLO or Track?
         run_yolo = (self.frame_count % self.detection_interval == 0) and is_stable
         
@@ -643,7 +703,8 @@ class Perception:
             "items": [],
             "obstacles": [],
             "goal": None,
-            "health": 1.0
+            "health": 1.0,
+            "is_shake_hit": is_shake_hit
         }
         
         character_candidates = []
@@ -661,7 +722,9 @@ class Perception:
             if label == "character":
                 character_candidates.append((tid, xywh, conf))
             elif label == "throwable":
-                det_dict["items"].append(xywh)
+                # "make item detection confidence 100%" -> Only accept if conf is extremely high (effectively disabling it)
+                if conf > 0.99:
+                    det_dict["items"].append(xywh)
 
         # Identify Player
         # Updated: Center (offset left) Downward
@@ -965,7 +1028,7 @@ class Perception:
         # Red
         lower_red1 = np.array([0, 50, 50])
         upper_red1 = np.array([10, 255, 255])
-        lower_red2 = np.array([170, 50, 50])
+        lower_red2 = np.array([160, 50, 50]) # Widened range (was 170)
         upper_red2 = np.array([180, 255, 255])
         mask_red = cv2.bitwise_or(cv2.inRange(hsv, lower_red1, upper_red1), cv2.inRange(hsv, lower_red2, upper_red2))
         
@@ -1003,8 +1066,11 @@ class Perception:
             # Draw Anchor Box on Debug
             cv2.rectangle(vis_health, (0, 0), (anchor_width, h_roi), (255, 0, 0), 1)
             
-            # If less than 50% of the anchor columns are filled, assume bar is hidden
-            if filled_anchor_cols < (anchor_width * 0.5):
+            # If less than 20% (relaxed from 50%) of the anchor columns are filled, assume bar is hidden
+            # Also check if the *entire* bar is empty (sum of all cols)
+            total_filled = np.sum(col_sums > fill_threshold)
+            
+            if filled_anchor_cols < (anchor_width * 0.2) and total_filled < (w_roi * 0.1):
                 cv2.putText(vis_health, "Hidden (Full)", (5, h_roi//2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 self.debug_health = vis_health
                 return 1.0
@@ -1153,7 +1219,7 @@ class Perception:
                 gx = tx
                 gy = ty + int(h*0.5)
                 self.ui_rois[name] = (gx, gy, tw, th)
-                # print(f"Found {name} at {gx},{gy}")
+                print(f"Found UI Element: {name} at {gx},{gy}")
 
     def detect_cooldowns(self, frame):
         """
@@ -1267,16 +1333,110 @@ class Perception:
         
         return vx, vy
 
+    def estimate_depth(self, frame):
+        """
+        Estimates depth map from frame using MiDaS.
+        Returns normalized depth map (0..1) as numpy array [H, W].
+        """
+        if self.depth_model is None or self.depth_transform is None:
+            return np.zeros(frame.shape[:2], dtype=np.float32)
+            
+        try:
+            # Optimization: Resize frame to smaller size for faster inference
+            # MiDaS Small works well with 256x256 or 384x384
+            small_frame = cv2.resize(frame, (256, 256), interpolation=cv2.INTER_LINEAR)
+            
+            input_batch = self.depth_transform(small_frame).to(self.device)
+            
+            with torch.no_grad():
+                prediction = self.depth_model(input_batch)
+                
+                prediction = torch.nn.functional.interpolate(
+                    prediction.unsqueeze(1),
+                    size=frame.shape[:2],
+                    mode="bicubic",
+                    align_corners=False,
+                ).squeeze()
+                
+            depth_map = prediction.cpu().numpy()
+            
+            # Normalize to 0..1
+            depth_min = depth_map.min()
+            depth_max = depth_map.max()
+            if depth_max - depth_min > 1e-6:
+                depth_map = (depth_map - depth_min) / (depth_max - depth_min)
+            else:
+                depth_map = np.zeros_like(depth_map)
+                
+            return depth_map
+        except Exception as e:
+            # print(f"Depth Error: {e}")
+            return np.zeros(frame.shape[:2], dtype=np.float32)
+
+    def compute_raycasts(self, depth_map, grid_size=10, num_radial=16):
+        """
+        Samples depth map at a grid of points AND radial directions.
+        Returns flattened array of depth values.
+        """
+        h, w = depth_map.shape
+        
+        # 1. Grid Sampling (10x10)
+        step_x = w // (grid_size + 1)
+        step_y = h // (grid_size + 1)
+        
+        grid_rays = []
+        for i in range(1, grid_size + 1):
+            for j in range(1, grid_size + 1):
+                y = i * step_y
+                x = j * step_x
+                # Sample 3x3 area for robustness
+                # Ensure bounds
+                y1, y2 = max(0, y-1), min(h, y+2)
+                x1, x2 = max(0, x-1), min(w, x+2)
+                val = np.mean(depth_map[y1:y2, x1:x2])
+                grid_rays.append(val)
+        
+        # 2. Radial Sampling (16 directions from center)
+        radial_rays = []
+        cx, cy = w // 2, h // 2
+        max_radius = min(cx, cy)
+        
+        for i in range(num_radial):
+            angle = (2 * np.pi * i) / num_radial
+            
+            # Walk the ray to find obstacle distance
+            hit_dist = 1.0 # Default max distance (normalized)
+            
+            # We walk from center outwards
+            # Start a bit away from player center to avoid self-occlusion
+            for r in range(20, max_radius, 5): 
+                tx = int(cx + r * np.cos(angle))
+                ty = int(cy + r * np.sin(angle))
+                
+                if tx < 0 or tx >= w or ty < 0 or ty >= h:
+                    break
+                
+                d_val = depth_map[ty, tx]
+                # Assuming depth_map is 0 (far) to 1 (close)
+                # If d_val > 0.5, we hit something close
+                if d_val > 0.5: 
+                    hit_dist = r / max_radius
+                    break
+            
+            radial_rays.append(hit_dist)
+                
+        return np.concatenate([np.array(grid_rays, dtype=np.float32), np.array(radial_rays, dtype=np.float32)])
+
     def get_obs(self, frame, last_action=None, mouse_movement=(0,0)):
         """
         Main function to get observation vector from frame.
-        Returns np.array of shape (20,)
+        Returns np.array of shape (151,)
         """
         # Performance check
         t0 = time.time()
         
-        # Periodic UI Scan (every 60 frames)
-        if self.frame_count % 60 == 0:
+        # Periodic UI Scan (every 60 frames) or if missing
+        if self.frame_count % 60 == 0 or not self.ui_rois:
             self.scan_ui(frame)
         
         det_dict = self.detect(frame, mouse_movement)
@@ -1319,6 +1479,10 @@ class Perception:
         found_enemy = False
         best_enemy = None # Initialize best_enemy
         
+        # Screen Center (for aiming)
+        screen_cx = INPUT_SIZE * 0.5
+        screen_cy = INPUT_SIZE * 0.5
+        
         if det_dict["enemies"]:
             # Find nearest to player (cx, cy)
             best_dist = float('inf')
@@ -1330,13 +1494,16 @@ class Perception:
                 else:
                     continue
 
-                dx = (ecx - cx) / INPUT_SIZE
-                dy = (ecy - cy) / INPUT_SIZE
-                dist = dx*dx + dy*dy
-                if dist < best_dist:
-                    best_dist = dist
-                    enemy_dx = dx
-                    enemy_dy = dy
+                # Calculate distance to player for selection
+                p_dx = (ecx - cx)
+                p_dy = (ecy - cy)
+                dist_p = p_dx*p_dx + p_dy*p_dy
+                
+                if dist_p < best_dist:
+                    best_dist = dist_p
+                    # Calculate aiming delta (relative to screen center)
+                    enemy_dx = (ecx - screen_cx) / INPUT_SIZE
+                    enemy_dy = (ecy - screen_cy) / INPUT_SIZE
                     best_enemy = item
             
             if best_enemy and len(best_enemy) >= 7:
@@ -1385,41 +1552,122 @@ class Perception:
         
         # Calculate Relative Size (Enemy Area / Player Area)
         relative_size = 0.0
-        if player is not None and found_enemy and best_enemy is not None:
+        is_overlapping = 0.0
+        leaks_above = 0.0
+        
+        # Player Box Area (Zoom Estimation)
+        player_area_norm = 0.0
+        
+        # Depth & Raycasts
+        depth_map = self.estimate_depth(frame)
+        raycasts = self.compute_raycasts(depth_map, grid_size=10, num_radial=16) # 100 + 16 = 116 values
+        
+        # Occlusion & Relative Position
+        is_occluded = 0.0
+        
+        if player is not None:
             # player: (cx, cy, w, h, ...)
-            # best_enemy: (x, y, w, h, ...)
             p_area = player[2] * player[3]
-            e_area = best_enemy[2] * best_enemy[3]
-            if p_area > 0:
-                relative_size = e_area / p_area
+            player_area_norm = p_area / (INPUT_SIZE * INPUT_SIZE)
+            
+            if found_enemy and best_enemy is not None:
+                # best_enemy: (x, y, w, h, ...)
+                e_area = best_enemy[2] * best_enemy[3]
+                if p_area > 0:
+                    relative_size = e_area / p_area
+                
+                # Check Overlap
+                # Convert center-xywh to top-left-xywh
+                px, py, pw, ph = player[:4]
+                ex, ey, ew, eh = best_enemy[:4]
+                
+                px1, py1 = px - pw/2, py - ph/2
+                px2, py2 = px + pw/2, py + ph/2
+                
+                ex1, ey1 = ex - ew/2, ey - eh/2
+                ex2, ey2 = ex + ew/2, ey + eh/2
+                
+                # Overlap condition
+                if (px1 < ex2 and px2 > ex1 and py1 < ey2 and py2 > ey1):
+                    is_overlapping = 1.0
+                    
+                # Leaks Above Condition (Enemy top is higher than Player top)
+                # In image coords, higher means smaller Y
+                if ey1 < py1:
+                    leaks_above = 1.0
+                    
+                # Occlusion Check
+                # Sample depth at enemy center
+                cx_int, cy_int = int(ex), int(ey)
+                if 0 <= cx_int < INPUT_SIZE and 0 <= cy_int < INPUT_SIZE:
+                     d_val = depth_map[cy_int, cx_int]
+                     # Heuristic: If depth is HIGH (close) but enemy is SMALL (far), it's an occlusion.
+                     # Expected depth ~ sqrt(area)
+                     expected_d = np.sqrt(e_area) / INPUT_SIZE * 5.0 
+                     if d_val > (expected_d + 0.3): 
+                         is_occluded = 1.0
+        
+        # Ego Motion (Global Flow)
+        g_dx, g_dy = 0.0, 0.0
+        if len(self.global_motion_history) > 0:
+            g_dx, g_dy = self.global_motion_history[-1]
+            # Normalize roughly (-1..1 for typical fast movement)
+            g_dx /= 20.0
+            g_dy /= 20.0
+            
+        # New Features: Heading, Relative Pos, Motion Prediction
+        heading_to_target = np.arctan2(enemy_dy, enemy_dx) # Radians
+        
+        is_left = 1.0 if enemy_dx < -0.1 else 0.0
+        is_right = 1.0 if enemy_dx > 0.1 else 0.0
+        is_above = 1.0 if enemy_dy < -0.1 else 0.0 # Up on screen
+        is_below = 1.0 if enemy_dy > 0.1 else 0.0 # Down on screen
+        
+        # Motion Prediction (Kalman)
+        # self.kalman.statePost -> [x, y, vx, vy]
+        # We want predicted displacement
+        k_state = self.kalman.statePost
+        # These are in pixels/frame (internal state)
+        # We want normalized predicted velocity
+        pred_vx = float(k_state[2]) / INPUT_SIZE * 10.0 # Scale up
+        pred_vy = float(k_state[3]) / INPUT_SIZE * 10.0
         
         # Build Vector
-        # [px, py, vx, vy, edx, edy, odx, ody, dist_goal, time_since_seen, health, 
-        #  enemy_flash, mode, evasive, special, p_ragdoll, cd1, cd2, cd3, cd4, relative_size]
-        
-        # MAPPING UPDATE:
-        # health -> health (Back to healthbar)
-        # enemy_health -> enemy_flash
-        # is_ragdolled -> p_ragdoll
+        # Base: 27 + 8 = 35
+        # Raycasts: 116
+        # Total: 151
         
         health = det_dict.get("health", 1.0)
+        is_shake_hit = det_dict.get("is_shake_hit", 0.0)
         
-        obs = np.array([
+        base_obs = [
             px_norm, py_norm, 
             vx, vy, 
             enemy_dx, enemy_dy, 
             obs_dx, obs_dy, 
             dist_goal,
             time_since_seen_norm,
-            health,        # Was p_flash. Now health.
-            enemy_flash,   # Was enemy_health
+            health,        
+            enemy_flash,   
             mode_lvl,
             evasive_lvl,
             special_lvl,
-            p_ragdoll,     # Was is_ragdolled (logic updated)
+            p_ragdoll,     
             cooldowns[0], cooldowns[1], cooldowns[2], cooldowns[3],
-            relative_size
-        ], dtype=np.float32)
+            relative_size,
+            is_overlapping,
+            leaks_above,
+            is_shake_hit,
+            player_area_norm,
+            g_dx, g_dy,
+            # New Features
+            heading_to_target,
+            is_left, is_right, is_above, is_below,
+            is_occluded,
+            pred_vx, pred_vy
+        ]
+        
+        obs = np.concatenate([np.array(base_obs, dtype=np.float32), raycasts])
         
         # Sanity check / Clip
         obs = np.nan_to_num(obs, nan=0.0)
@@ -1445,19 +1693,30 @@ class Perception:
         Generates pixel-based observation dictionary.
         Returns:
             {
-                'full': np.array [12, 160, 160],
-                'crop': np.array [12, 96, 96],
+                'full': np.array [16, 160, 160], # 4 frames * (RGB + Depth)
+                'crop': np.array [16, 128, 128],
                 'flow': np.array [2, 160, 160]
             }
         """
         if frame is None: return None
         
+        # Depth Estimation
+        depth_map = self.estimate_depth(frame) # [H, W] 0..1
+        self.last_depth_vis = (depth_map * 255).astype(np.uint8)
+        self.last_depth_vis = cv2.applyColorMap(self.last_depth_vis, cv2.COLORMAP_MAGMA)
+        
         # 1. Full Frame (160x160)
         full_img = cv2.resize(frame, (160, 160), interpolation=cv2.INTER_LINEAR)
-        # Normalize to 0-1
+        full_depth = cv2.resize(depth_map, (160, 160), interpolation=cv2.INTER_LINEAR)
+        
+        # Normalize RGB to 0-1
         full_norm = full_img.astype(np.float32) / 255.0
-        # Transpose to [C, H, W]
-        full_tensor = np.transpose(full_norm, (2, 0, 1))
+        
+        # Stack RGB + Depth -> [160, 160, 4]
+        full_combined = np.dstack([full_norm, full_depth])
+        
+        # Transpose to [C, H, W] -> [4, 160, 160]
+        full_tensor = np.transpose(full_combined, (2, 0, 1))
         
         # 2. Fine Crop (128x128)
         # Use cached detection if available (populated by get_obs)
@@ -1523,24 +1782,34 @@ class Perception:
             y2 = min(h, y1 + crop_size)
         
         crop_img = frame[y1:y2, x1:x2]
+        crop_depth = depth_map[y1:y2, x1:x2]
         
         # Pad if out of bounds
         if crop_img.shape[0] != crop_size or crop_img.shape[1] != crop_size:
             padded = np.zeros((crop_size, crop_size, 3), dtype=np.uint8)
+            padded_depth = np.zeros((crop_size, crop_size), dtype=np.float32)
             ph, pw = crop_img.shape[:2]
             
             # Safety check for broadcasting error
             if ph > crop_size or pw > crop_size:
                 # This should not happen given x1, x2 logic, but if it does, resize
                 crop_img = cv2.resize(crop_img, (crop_size, crop_size))
+                crop_depth = cv2.resize(crop_depth, (crop_size, crop_size))
                 padded = crop_img
+                padded_depth = crop_depth
             else:
                 padded[:ph, :pw] = crop_img
+                padded_depth[:ph, :pw] = crop_depth
             
             crop_img = padded
+            crop_depth = padded_depth
             
         crop_norm = crop_img.astype(np.float32) / 255.0
-        crop_tensor = np.transpose(crop_norm, (2, 0, 1))
+        
+        # Stack RGB + Depth -> [128, 128, 4]
+        crop_combined = np.dstack([crop_norm, crop_depth])
+        
+        crop_tensor = np.transpose(crop_combined, (2, 0, 1))
         
         # 3. Optical Flow (Farneback)
         # Compute on 160x160 gray
@@ -1590,7 +1859,7 @@ class Perception:
             self.crop_stack.append(crop_tensor)
             
         # Concatenate Stacks
-        # [4, 3, 160, 160] -> [12, 160, 160]
+        # [4, 4, 160, 160] -> [16, 160, 160]
         full_stack = np.concatenate(list(self.frame_stack), axis=0)
         crop_stack = np.concatenate(list(self.crop_stack), axis=0)
         
@@ -1608,14 +1877,27 @@ class Perception:
             return np.zeros((300, 300, 3), dtype=np.uint8)
             
         # Get latest frames from stack
-        # frame_stack: [C, H, W] where C=12 (3 channels * 4 frames)
-        # We want the last 3 channels (latest frame)
-        full_tensor = self.frame_stack[-1] # [3, 160, 160]
-        crop_tensor = self.crop_stack[-1] # [3, 96, 96]
+        # frame_stack: [C, H, W] where C=16 (4 channels * 4 frames)
+        # We want the last 4 channels (latest frame: RGBD)
+        
+        # full_tensor is [4, 160, 160] (RGBD)
+        full_tensor = self.frame_stack[-1] 
+        crop_tensor = self.crop_stack[-1] 
+        
+        # Extract RGB [3, H, W]
+        full_rgb = full_tensor[:3, :, :]
+        crop_rgb = crop_tensor[:3, :, :]
+
+        # Extract Depth [1, H, W] -> [H, W]
+        full_depth = full_tensor[3, :, :]
         
         # Convert back to HWC and uint8
-        full_img = (np.transpose(full_tensor, (1, 2, 0)) * 255).astype(np.uint8)
-        crop_img = (np.transpose(crop_tensor, (1, 2, 0)) * 255).astype(np.uint8)
+        full_img = (np.transpose(full_rgb, (1, 2, 0)) * 255).astype(np.uint8)
+        crop_img = (np.transpose(crop_rgb, (1, 2, 0)) * 255).astype(np.uint8)
+
+        # Convert Depth to Color Map for visualization
+        depth_vis = (full_depth * 255).astype(np.uint8)
+        depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_MAGMA)
         
         # Create a composite image
         # Canvas: 400x350
@@ -1637,6 +1919,26 @@ class Perception:
              # Resize to fit if needed, flow is 160x160
              canvas[170:170+fh, 0:fw] = self.last_flow_vis
              cv2.putText(canvas, "Flow Input", (5, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # Place Depth at (170, 170)
+        dh, dw = depth_vis.shape[:2]
+        canvas[170:170+dh, 170:170+dw] = depth_vis
+        
+        # Debug Text for Depth
+        d_min = full_depth.min()
+        d_max = full_depth.max()
+        cv2.putText(canvas, f"Depth: {d_min:.2f}-{d_max:.2f}", (175, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        
+        # Debug Text for UI / Cooldowns
+        # We need to access the latest cooldowns. They are not stored in the stack.
+        # We can try to read them from the last observation if we had access, but we don't here easily.
+        # However, we can check self.ui_rois count.
+        ui_count = len(self.ui_rois)
+        cv2.putText(canvas, f"UI ROIs: {ui_count}", (5, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        
+        # Check if MiDaS is loaded
+        midas_status = "OK" if self.depth_model is not None else "FAIL"
+        cv2.putText(canvas, f"MiDaS: {midas_status}", (175, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
              
         return canvas
         

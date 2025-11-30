@@ -5,18 +5,16 @@ import torchvision.models as models
 import numpy as np
 
 class TwoStreamNetwork(nn.Module):
-    def __init__(self, action_dim, hidden_dim=256, lstm_hidden=128):
+    def __init__(self, action_dim, hidden_dim=1024, lstm_hidden=768, vector_dim=151):
         super(TwoStreamNetwork, self).__init__()
         
-        # --- 1. Full Frame Encoder (MobileNetV3 Small) ---
-        # Input: [Batch, 12, 160, 160] (4 frames * 3 channels)
-        # We modify the first layer to accept 12 channels instead of 3
-        self.full_encoder = models.mobilenet_v3_small(weights=None)
+        # --- 1. Full Frame Encoder (MobileNetV3 Large + Extra Layers) ---
+        # Input: [Batch, 16, 160, 160] (4 frames * 4 channels RGBD)
+        self.full_encoder = models.mobilenet_v3_large(weights=None)
         
-        # Modify first conv layer for 12 channels
         original_first_layer = self.full_encoder.features[0][0]
         self.full_encoder.features[0][0] = nn.Conv2d(
-            in_channels=12,
+            in_channels=16, # Updated for RGBD stack
             out_channels=original_first_layer.out_channels,
             kernel_size=original_first_layer.kernel_size,
             stride=original_first_layer.stride,
@@ -24,15 +22,36 @@ class TwoStreamNetwork(nn.Module):
             bias=False
         )
         
-        # Remove classifier, keep feature extractor
-        # MobileNetV3 Small output features: 576 channels at 5x5 (for 160x160 input) -> GlobalPool -> 576
         self.full_encoder.classifier = nn.Identity()
-        self.full_feature_dim = 576 
+        # MobileNetV3 Large output: 960. Add extra processing.
+        self.full_extra = nn.Sequential(
+            nn.Linear(960, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1024),
+            nn.ReLU()
+        )
+        self.full_feature_dim = 1024
 
-        # --- 2. Fine Crop Encoder (Small CNN) ---
-        # Input: [Batch, 12, 128, 128]
+        # --- 2. Fine Crop Encoder (Quadrupled Capacity) ---
+        # Input: [Batch, 16, 128, 128] (4 frames * 4 channels RGBD)
         self.crop_encoder = nn.Sequential(
-            nn.Conv2d(12, 32, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(16, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten()
+        )
+        self.crop_feature_dim = 512
+
+        # --- 3. Optical Flow Encoder (Quadrupled Capacity) ---
+        # Input: [Batch, 2, 160, 160]
+        self.flow_encoder = nn.Sequential(
+            nn.Conv2d(2, 32, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
@@ -41,47 +60,77 @@ class TwoStreamNetwork(nn.Module):
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten()
         )
-        self.crop_feature_dim = 128
-
-        # --- 3. Optical Flow Encoder (Small CNN) ---
-        # Input: [Batch, 2, 160, 160] (Magnitude of flow for last 2 frames? Or 2 channels x 1 frame?)
-        # User said: "flow = compute_optical_flow(last2 frames) # shape [2, H, W]"
-        self.flow_encoder = nn.Sequential(
-            nn.Conv2d(2, 16, kernel_size=3, stride=2, padding=1),
+        self.flow_feature_dim = 128
+        
+        # --- 4. Vector Encoder (New) ---
+        # Input: [Batch, vector_dim]
+        self.vector_encoder = nn.Sequential(
+            nn.Linear(vector_dim, 128),
             nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten()
+            nn.Linear(128, 128),
+            nn.ReLU()
         )
-        self.flow_feature_dim = 32
+        self.vector_feature_dim = 128
         
-        # --- 4. Fusion & Temporal ---
-        self.fusion_dim = self.full_feature_dim + self.crop_feature_dim + self.flow_feature_dim
+        # --- 5. Fusion & Temporal (Deep MLP + Stacked LSTM) ---
+        self.fusion_dim = self.full_feature_dim + self.crop_feature_dim + self.flow_feature_dim + self.vector_feature_dim
         
-        # Fusion Layer (Linear Projection)
-        # 1024 -> 256 -> 128 (LSTM)
+        # Deep Fusion MLP
         self.fusion_layer = nn.Sequential(
-            nn.Linear(self.fusion_dim, 1024),
+            nn.Linear(self.fusion_dim, 2048),
             nn.ReLU(),
-            nn.Linear(1024, 256),
+            nn.Linear(2048, 2048),
+            nn.ReLU(),
+            nn.Linear(2048, 1024),
             nn.ReLU()
         )
         
-        self.lstm = nn.LSTM(256, 128, batch_first=True)
+        # Stacked LSTM (2 Layers, 768 Hidden)
+        self.lstm = nn.LSTM(1024, 768, num_layers=2, batch_first=True)
         
-        # --- 5. Heads ---
-        self.actor = nn.Sequential(
-            nn.Linear(128, 64),
+        # --- 6. Multi-Branch Action Head with Combo Intention ---
+        # "Add an action head with multi branching, temporal smoothing, and action chunking logic. Add a “combo intention embedding.”"
+        
+        # Combo Intention Embedding (Internal State)
+        # We project the LSTM output to an "Intention" vector
+        self.intention_net = nn.Sequential(
+            nn.Linear(768, 512),
             nn.ReLU(),
-            nn.Linear(64, action_dim),
+            nn.Linear(512, 384) # 384-dim Intention Embedding
+        )
+        
+        # Multi-Branch Heads
+        # Branch 1: Movement (W, A, S, D, Dashes, Turns)
+        self.movement_head = nn.Sequential(
+            nn.Linear(768 + 384, 512), # LSTM + Intention
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU()
+        )
+        
+        # Branch 2: Combat (Attacks, Blocks, Combos)
+        self.combat_head = nn.Sequential(
+            nn.Linear(768 + 384, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU()
+        )
+        
+        # Final Action Projection (Merging Branches)
+        # We combine the branch outputs to produce the final logits
+        self.final_action_layer = nn.Sequential(
+            nn.Linear(256 + 256, 256),
+            nn.ReLU(),
+            nn.Linear(256, action_dim),
             nn.Softmax(dim=-1)
         )
         
         self.critic = nn.Sequential(
-            nn.Linear(128, 64),
+            nn.Linear(768, 256),
             nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
         )
         
         # Initialize Weights
@@ -99,7 +148,7 @@ class TwoStreamNetwork(nn.Module):
                 elif 'bias' in name:
                     param.data.fill_(0.0)
         
-    def forward(self, full_frames, crop_frames, flow, hidden_state=None, seq_len=1):
+    def forward(self, full_frames, crop_frames, flow, vector_obs, hidden_state=None, seq_len=1):
         """
         full_frames: [Batch*Seq, C, H, W]
         seq_len: Length of sequence (default 1 for inference)
@@ -107,33 +156,51 @@ class TwoStreamNetwork(nn.Module):
         # 1. Encode Full Frames
         x_full = self.full_encoder.features(full_frames)
         x_full = self.full_encoder.avgpool(x_full)
-        x_full = torch.flatten(x_full, 1) # [Batch*Seq, 576]
+        x_full = torch.flatten(x_full, 1) # [Batch*Seq, 960]
+        x_full = self.full_extra(x_full) # [Batch*Seq, 1024]
         
         # 2. Encode Crop
-        x_crop = self.crop_encoder(crop_frames) # [Batch*Seq, 128]
+        x_crop = self.crop_encoder(crop_frames) # [Batch*Seq, 512]
         
         # 3. Encode Flow
-        x_flow = self.flow_encoder(flow) # [Batch*Seq, 32]
+        x_flow = self.flow_encoder(flow) # [Batch*Seq, 128]
         
-        # 4. Fusion
-        fusion = torch.cat([x_full, x_crop, x_flow], dim=1) # [Batch*Seq, Fusion_Dim]
+        # 4. Encode Vector
+        x_vector = self.vector_encoder(vector_obs) # [Batch*Seq, 128]
+        
+        # 5. Fusion
+        fusion = torch.cat([x_full, x_crop, x_flow, x_vector], dim=1) # [Batch*Seq, Fusion_Dim]
         
         # Project
-        fusion_proj = self.fusion_layer(fusion) # [Batch*Seq, 256]
+        fusion_proj = self.fusion_layer(fusion) # [Batch*Seq, 1024]
         
-        # 5. LSTM
+        # 6. LSTM
         # Reshape to [Batch, Seq, Features]
         batch_size = fusion_proj.size(0) // seq_len
         fusion_seq = fusion_proj.view(batch_size, seq_len, -1)
         
-        lstm_out, new_hidden = self.lstm(fusion_seq, hidden_state) # [Batch, Seq, 128]
+        lstm_out, new_hidden = self.lstm(fusion_seq, hidden_state) # [Batch, Seq, 768]
         
-        # 6. Heads
-        # Flatten back to [Batch*Seq, 128] for heads
-        lstm_out_flat = lstm_out.reshape(-1, 128)
+        # 7. Heads with Multi-Branching & Intention
+        # Flatten back to [Batch*Seq, 768]
+        lstm_out_flat = lstm_out.reshape(-1, 768)
         
-        action_probs = self.actor(lstm_out_flat)
+        # Generate Intention
+        intention = self.intention_net(lstm_out_flat) # [Batch*Seq, 128]
+        
+        # Concatenate LSTM output with Intention for branches
+        branch_input = torch.cat([lstm_out_flat, intention], dim=1) # [Batch*Seq, 768+128]
+        
+        # Branch Processing
+        move_feat = self.movement_head(branch_input) # [Batch*Seq, 128]
+        combat_feat = self.combat_head(branch_input) # [Batch*Seq, 128]
+        
+        # Merge Branches
+        merged_feat = torch.cat([move_feat, combat_feat], dim=1) # [Batch*Seq, 256]
+        
+        action_probs = self.final_action_layer(merged_feat)
         value = self.critic(lstm_out_flat)
         
-        return action_probs, value, new_hidden
+        return action_probs, value, new_hidden, intention
+
 

@@ -26,3 +26,6 @@ config.json
 # model update logs
 *.txt
 perf_log.txt
+
+# models (theyre too big to keep in repo)
+ppo_agent_pixel.pth

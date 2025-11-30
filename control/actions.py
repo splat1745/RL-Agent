@@ -1,4 +1,5 @@
 # Define action mapping
+# Structured Action Space for Combo/Planning
 # 0: Idle
 # 1: W
 # 2: A
@@ -23,12 +24,17 @@ ACTION_MAP = {
     12: "2",
     13: "3",
     14: "4",
-    15: "r",
-    16: "r_2",
-    17: "g",
-    18: "click",
-    19: "look_up",
-    20: "look_down"
+    15: "r_2", # Combo: R + 2
+    16: "g",
+    17: "space", # Jump (New)
+    18: "f", # Block
+    19: "m1", # Single M1 (Replaces Macros)
+    20: "turn_left_micro", # 5px
+    21: "turn_right_micro", # 5px
+    22: "turn_left_small", # 20px
+    23: "turn_right_small", # 20px
+    24: "turn_left_large", # 50px
+    25: "turn_right_large", # 50px
 }
 
 def get_action_name(action_id):

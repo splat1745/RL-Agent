@@ -146,7 +146,7 @@ def direct_policy_loop(policy, controller, state_manager):
                 status_queue.get_nowait()
             except queue.Empty:
                 pass
-        status_queue.put((action_name, reward))
+        status_queue.put((action_name, reward, None))
         
         time_step += 1
 
@@ -157,6 +157,7 @@ def agent_loop(agent, memory, controller, state_manager, update_timestep, model_
     print("Agent Thread Started.")
     time_step = 0
     running_reward = 0
+    hit_history_batch = []
     
     # No more obs_stack here, handled in inference.py
     
@@ -171,8 +172,12 @@ def agent_loop(agent, memory, controller, state_manager, update_timestep, model_
             
         # 3. Agent -> Action
         # pixel_obs is a dict {'full': ..., 'crop': ..., 'flow': ...}
-        action_idx, log_prob = agent.select_action(pixel_obs)
+        # vector_obs is np.array [36]
+        action_idx, log_prob, intention = agent.select_action(pixel_obs, vector_obs)
         action_name = get_action_name(action_idx)
+        
+        # Auto-Lock Feature REMOVED
+        # "Remove autolock from everything. direct policy should not be accessable to RL agent."
         
         # Debug Print
         print(f"Agent Step {time_step}: Action={action_name}")
@@ -181,7 +186,10 @@ def agent_loop(agent, memory, controller, state_manager, update_timestep, model_
         controller.execute(action_name, duration=0.3)
         
         # 5. Calculate Reward (Use vector_obs for logic)
+        last_hit_len = len(state_manager.hit_history)
         reward = calculate_reward(vector_obs, action_idx, state_manager)
+        was_hit = len(state_manager.hit_history) > last_hit_len
+        hit_history_batch.append(was_hit)
         
         # Update Status for Main Thread
         if status_queue.full():
@@ -189,10 +197,11 @@ def agent_loop(agent, memory, controller, state_manager, update_timestep, model_
                 status_queue.get_nowait()
             except queue.Empty:
                 pass
-        status_queue.put((action_name, reward))
+        status_queue.put((action_name, reward, intention))
         
         # 6. Store in Memory
-        memory.states.append(pixel_obs)
+        # Store tuple of (pixel_obs, vector_obs)
+        memory.states.append((pixel_obs, vector_obs))
         memory.actions.append(action_idx)
         memory.logprobs.append(log_prob)
         memory.rewards.append(reward)
@@ -204,11 +213,12 @@ def agent_loop(agent, memory, controller, state_manager, update_timestep, model_
         # 7. Update Policy
         if time_step % update_timestep == 0:
             print(f"Updating Policy... Avg Reward: {running_reward/update_timestep:.2f}")
-            agent.update(memory)
+            agent.update(memory, hit_history=hit_history_batch)
             memory.clear()
+            hit_history_batch = []
             # Reset hidden state after update? Or keep it?
             # Usually reset for batch updates if not using TBPTT
-            agent.reset_hidden()
+            # agent.reset_hidden() # We now persist hidden state in agent.update logic
             running_reward = 0
             
             # Save Model
@@ -226,8 +236,13 @@ def main():
         if arg == "--setup" or arg == "-s":
             force_setup = True
         elif not arg.startswith("-"):
-            yolo_model_path = arg
-            print(f"Overriding YOLO model with: {yolo_model_path}")
+            # Only accept the first valid path argument to avoid stray shell characters
+            if yolo_model_path is None:
+                clean_arg = arg.strip().strip('"').strip("'")
+                # Ignore stray backslashes or empty strings
+                if clean_arg and clean_arg != "\\":
+                    yolo_model_path = clean_arg
+                    print(f"Overriding YOLO model with: {yolo_model_path}")
 
     # 1. Select Window
     capture_service.select_window()
@@ -248,9 +263,20 @@ def main():
     perception = init_perception(yolo_model_path)
     
     print("Initializing Agent...")
-    # Action Dim = 19 (Movement + Moves 1-4 + R + R_2 + G + Click)
-    # Excludes look_up (19) and look_down (20) which are for Direct Policy only
-    agent = PPOAgent(action_dim=19)
+    # Action Dim = 26 (Updated)
+    # 0-14: Basic + Look X
+    # 15: r_2
+    # 16: g
+    # 17: space (Jump)
+    # 18: f (Block)
+    # 19: m1 (Single Click)
+    # 20: turn_left_micro
+    # 21: turn_right_micro
+    # 22: turn_left_small
+    # 23: turn_right_small
+    # 24: turn_left_large
+    # 25: turn_right_large
+    agent = PPOAgent(action_dim=26)
     
     # Load existing model
     model_path = "ppo_agent_pixel.pth" # Changed name to avoid conflict
@@ -278,7 +304,7 @@ def main():
     
     if mode == "agent":
         # 5. Start Agent Thread
-        agent_thread = threading.Thread(target=agent_loop, args=(agent, memory, controller, state_manager, 20, model_path))
+        agent_thread = threading.Thread(target=agent_loop, args=(agent, memory, controller, state_manager, 10, model_path))
         agent_thread.daemon = True
         agent_thread.start()
     elif mode == "direct":
@@ -293,6 +319,7 @@ def main():
     # Visualization State
     current_action = "idle"
     current_reward = 0.0
+    current_intention = None
     
     fps_start_time = time.time()
     fps_counter = 0
@@ -329,7 +356,7 @@ def main():
             
             # Check for status updates from Agent
             try:
-                current_action, current_reward = status_queue.get_nowait()
+                current_action, current_reward, current_intention = status_queue.get_nowait()
             except queue.Empty:
                 pass
             
@@ -344,6 +371,35 @@ def main():
                 cv2.putText(vis_frame, f"Action: {current_action}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(vis_frame, f"Reward: {current_reward:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
+                # Draw Intention Preview
+                if current_intention is not None:
+                    # Intention is [1, 384]
+                    # Visualize as a small heatmap bar
+                    intent_vis = current_intention.reshape(12, 32) # 12x32 grid
+                    # Normalize for vis
+                    intent_vis = (intent_vis - intent_vis.min()) / (intent_vis.max() - intent_vis.min() + 1e-6)
+                    intent_vis = (intent_vis * 255).astype(np.uint8)
+                    intent_vis = cv2.applyColorMap(intent_vis, cv2.COLORMAP_JET)
+                    intent_vis = cv2.resize(intent_vis, (160, 80), interpolation=cv2.INTER_NEAREST)
+                    
+                    # Add Grid Lines
+                    # Rows: 12
+                    step_y = 80 / 12
+                    for i in range(1, 12):
+                        y = int(i * step_y)
+                        cv2.line(intent_vis, (0, y), (160, y), (0,0,0), 1)
+                    
+                    # Cols: 32
+                    step_x = 160 / 32
+                    for i in range(1, 32):
+                        x = int(i * step_x)
+                        cv2.line(intent_vis, (x, 0), (x, 80), (0,0,0), 1)
+                    
+                    # Overlay on frame
+                    h, w = vis_frame.shape[:2]
+                    vis_frame[h-90:h-10, 10:170] = intent_vis
+                    cv2.putText(vis_frame, "Intention Map", (10, h-95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
                 # FPS Calculation
                 fps_counter += 1
                 if time.time() - fps_start_time >= 1.0:
@@ -361,7 +417,7 @@ def main():
                 
                 # ROI Preview (Agent Mode)
                 debug_imgs = []
-                target_h = 300 # Increased from 100
+                target_h = 50 # Reduced from 300
                 
                 if hasattr(perception, 'debug_health') and perception.debug_health is not None:
                     # Explicitly cast shape to tuple to avoid type checker issues
