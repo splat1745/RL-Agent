@@ -53,11 +53,23 @@ Train a model. The script supports both YOLO and RF-DETR.
 *   `--grad-accum`: Gradient accumulation steps (RF-DETR only, default: 4).
 *   `--device`: Device to run on (e.g., `0`, `0,1`, `cuda`).
 
+### Performance Tuning
+To halve training time, you need to maximize GPU usage.
+*   **Increase Batch Size**: Use `--batch 16` or `--batch 32` (depending on VRAM).
+*   **Decrease Gradient Accumulation**: If you increase batch size, you can decrease `--grad-accum` to keep the effective batch size (Batch * Accum) constant, or keep it high for better convergence.
+*   **Workers**: Default is now 8. If your CPU is strong, this ensures the GPU doesn't wait for data.
+
 **Examples:**
 
-*   **High Performance Training (Double Batch Size):**
+*   **High Performance (RTX 3090/4090):**
+    Doubles the workload per step compared to default.
     ```bash
-    python pipeline.py train rfdetr s --batch 8 --grad-accum 2
+    python pipeline.py train rfdetr s --batch 16 --grad-accum 1
+    ```
+
+*   **Max Performance (If VRAM allows):**
+    ```bash
+    python pipeline.py train rfdetr s --batch 32 --grad-accum 1
     ```
 
 *   **Train RF-DETR Small on specific datasets:**
@@ -85,7 +97,37 @@ python pipeline.py infer runs/train/weights/best.pt data/frames/session_01
 
 ## Directory Structure
 
-*   `pipeline.py`: Main CLI tool.
-*   `main.py`: Real-time inference agent.
+*   `pipeline.py`: Main CLI tool for training and dataset management.
+*   `main.py`: Real-time RL agent.
 *   `detection/`: Inference logic.
 *   `control/`: Keyboard/Mouse control logic.
+
+## Running the RL Agent
+
+The `main.py` script runs the real-time RL agent with object detection.
+
+**Arguments:**
+*   `--model`, `-m`: Path to detection model (`.pt` for YOLO, `.pth` for RF-DETR).
+*   `--setup`, `-s`: Force run the setup wizard.
+
+**Examples:**
+
+*   **Run with default model:**
+    ```bash
+    python main.py
+    ```
+
+*   **Run with custom YOLO model:**
+    ```bash
+    python main.py --model "path/to/best.pt"
+    ```
+
+*   **Run with RF-DETR model:**
+    ```bash
+    python main.py --model "D:\Auto-Farmer-Data\runs\seq_train_rfdetr_s\dataset5_run\checkpoint_best_ema.pth"
+    ```
+
+*   **Force setup wizard:**
+    ```bash
+    python main.py --setup
+    ```

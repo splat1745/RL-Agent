@@ -1,5 +1,6 @@
 import time
 import sys
+import argparse
 import cv2
 import numpy as np
 import torch
@@ -228,24 +229,23 @@ def agent_loop(agent, memory, controller, state_manager, update_timestep, model_
 def main():
     print("--- Auto-Farmer RL Agent ---")
     
-    # Parse args
-    force_setup = False
-    yolo_model_path = None
+    # Parse args with argparse
+    parser = argparse.ArgumentParser(description="Auto-Farmer RL Agent")
+    parser.add_argument("--setup", "-s", action="store_true", help="Force run the setup wizard")
+    parser.add_argument("--model", "-m", type=str, default=None, 
+                        help="Path to detection model (.pt for YOLO, .pth for RF-DETR)")
+    args = parser.parse_args()
     
-    for arg in sys.argv[1:]:
-        if arg == "--setup" or arg == "-s":
-            force_setup = True
-        elif not arg.startswith("-"):
-            # Only accept the first valid path argument to avoid stray shell characters
-            if yolo_model_path is None:
-                clean_arg = arg.strip().strip('"').strip("'")
-                # Ignore stray backslashes or empty strings
-                if clean_arg and clean_arg != "\\":
-                    yolo_model_path = clean_arg
-                    print(f"Overriding YOLO model with: {yolo_model_path}")
+    force_setup = args.setup
+    detection_model_path = args.model
+    
+    if detection_model_path:
+        print(f"Using detection model: {detection_model_path}")
 
     # 1. Select Window
-    capture_service.select_window()
+    # capture_service.select_window()
+    print("Auto-selecting 'Roblox' window...")
+    capture_service.window_title = "Roblox"
     
     # Start Capture early to check resolution
     print("Starting Screen Capture...")
@@ -260,7 +260,7 @@ def main():
     
     # 2. Initialize Components
     print("Initializing Perception...")
-    perception = init_perception(yolo_model_path)
+    perception = init_perception(detection_model_path)
     
     print("Initializing Agent...")
     # Action Dim = 26 (Updated)

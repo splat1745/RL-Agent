@@ -7,9 +7,22 @@ from collections import deque, defaultdict
 import json
 import os
 import traceback
+import warnings
+
+# Filter RF-DETR warnings
+warnings.filterwarnings("ignore", message=".*Using a different number of positional encodings.*")
+warnings.filterwarnings("ignore", message=".*Using patch size.*")
+
+# Try to import RF-DETR
+try:
+    from rfdetr import RFDETRBase, RFDETRSmall, RFDETRNano, RFDETRMedium, RFDETRLarge
+    RFDETR_AVAILABLE = True
+except ImportError:
+    RFDETR_AVAILABLE = False
 
 # --- Configuration ---
-MODEL_PATH = r"T:\Auto-Farmer-Data\runs\combined_training_p3\weights\best.pt" # Updated to combined model
+# Updated: Now supports RF-DETR .pth files
+MODEL_PATH = r"D:\Auto-Farmer-Data\runs\seq_train_rfdetr_s\dataset5_run\checkpoint_best_ema.pth"
 INPUT_SIZE = 640
 CONF_THRESHOLD = 0.20 # Lowered from 0.25
 IOU_THRESHOLD = 0.45
@@ -20,12 +33,76 @@ print(f"Perception Config: Device={DEVICE}, FP16={HALF_PRECISION}, Torch={torch.
 
 # Class mapping (Adjust based on your model's training)
 # Based on pipeline.py CLASSES list (Obstacles removed)
+# Swapped 0 and 1 based on observation that Player (center) is detected as Class 1
+# Added Class 2 as throwable based on logs
 CLASS_MAP = {
-    0: "character",
-    1: "throwable"
+    0: "throwable",
+    1: "character",
+    2: "throwable"
 }
 # Fallback for COCO if using pretrained yolo11n.pt directly without custom training
 # We will assume 'person' (0) is player/enemy for now if not custom.
+
+class SimpleTracker:
+    """
+    A lightweight tracker using Lucas-Kanade Optical Flow.
+    Replaces cv2.TrackerKCF when opencv-contrib is missing.
+    """
+    def __init__(self):
+        self.bbox = None
+        self.prev_gray = None
+        self.pts = None
+
+    def init(self, frame, bbox):
+        self.bbox = bbox # (x, y, w, h)
+        self.prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Create grid of points within bbox
+        x, y, w, h = map(int, bbox)
+        # Ensure bounds
+        h_img, w_img = self.prev_gray.shape
+        x = max(0, x); y = max(0, y)
+        w = min(w, w_img - x); h = min(h, h_img - y)
+        
+        if w <= 0 or h <= 0: return
+        
+        # Grid of points
+        step = max(4, min(w, h) // 4)
+        grid_y, grid_x = np.mgrid[y+step//2:y+h:step, x+step//2:x+w:step]
+        self.pts = np.vstack((grid_x.flatten(), grid_y.flatten())).T.astype(np.float32).reshape(-1, 1, 2)
+
+    def update(self, frame):
+        if self.pts is None or len(self.pts) == 0:
+            return False, self.bbox
+            
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # LK Flow
+        next_pts, status, err = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, self.pts, None, winSize=(15, 15), maxLevel=2)
+        
+        # Select good points
+        if next_pts is not None:
+            good_new = next_pts[status == 1]
+            good_old = self.pts[status == 1]
+        else:
+            return False, self.bbox
+        
+        if len(good_new) < len(self.pts) * 0.5: # Lost too many points
+            return False, self.bbox
+            
+        # Estimate motion
+        motion = good_new - good_old
+        dx = np.median(motion[:, 0])
+        dy = np.median(motion[:, 1])
+        
+        # Update bbox
+        x, y, w, h = self.bbox
+        self.bbox = (x + dx, y + dy, w, h)
+        
+        # Update state
+        self.prev_gray = gray
+        self.pts = good_new.reshape(-1, 1, 2)
+        
+        return True, self.bbox
 
 class Perception:
     def __init__(self, model_path=MODEL_PATH, device=DEVICE, half=HALF_PRECISION):
@@ -191,7 +268,15 @@ class Perception:
         self.filtered_health = 1.0
 
         # --- Optimization & Advanced Hit Detection ---
-        self.detection_interval = 4 # Run YOLO every 4 frames
+        # Check if tracker is available
+        dummy_tracker = self._create_tracker()
+        if dummy_tracker is None:
+            print("Warning: No tracker found. Switching to per-frame detection (Performance may suffer).")
+            self.detection_interval = 1
+        else:
+            # Use SimpleTracker or KCF
+            self.detection_interval = 4
+            
         self.trackers = {} # ID -> cv2.Tracker
         self.tracker_failures = defaultdict(int)
         
@@ -201,7 +286,7 @@ class Perception:
         self.hit_cooldowns = defaultdict(float) # ID -> timestamp
 
     def _create_tracker(self):
-        """Creates a lightweight tracker (KCF or CSRT)."""
+        """Creates a lightweight tracker (KCF or CSRT or SimpleTracker)."""
         # Try KCF first (Fastest)
         try:
             return cv2.TrackerKCF_create()
@@ -216,11 +301,8 @@ class Perception:
                     try:
                         return cv2.legacy.TrackerCSRT_create()
                     except AttributeError:
-                        # Only print warning once
-                        if not hasattr(self, '_tracker_warning_shown'):
-                            print("Warning: No tracker found. Tracking disabled.")
-                            self._tracker_warning_shown = True
-                        return None
+                        # Fallback to SimpleTracker (Optical Flow)
+                        return SimpleTracker()
 
     def detect_hit_confirm(self, frame, enemy_box, player_box, tid):
         """
@@ -349,24 +431,148 @@ class Perception:
 
     def _init_model(self, path):
         print(f"Loading model {path} to {self.device}...")
+        
+        # Detect model type from file extension
+        self.is_rfdetr = path.endswith('.pth')
+        
         try:
-            model = YOLO(path)
-            # model.to() is not always needed for YOLO object if arguments handle it, 
-            # but explicit move is good.
-            # However, YOLO object itself isn't a nn.Module, model.model is.
-            # Ultralytics handles device automatically during inference usually, 
-            # but we can force it.
-            
-            # Warmup
-            print("Warming up model...")
-            # We pass device to the call
-            dummy = np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
-            _ = model(dummy, device=self.device, half=self.half, verbose=False)
-            print("Model ready.")
-            return model
+            if self.is_rfdetr:
+                # RF-DETR Model
+                if not RFDETR_AVAILABLE:
+                    raise ImportError("RF-DETR not installed. Run: pip install rfdetr")
+                
+                # Determine model size from path
+                path_lower = path.lower()
+                if 'nano' in path_lower:
+                    ModelClass = RFDETRNano
+                elif 'small' in path_lower or 'rfdetr_s' in path_lower or 'rfdetr-s' in path_lower:
+                    ModelClass = RFDETRSmall
+                elif 'medium' in path_lower:
+                    ModelClass = RFDETRMedium
+                elif 'large' in path_lower:
+                    ModelClass = RFDETRLarge
+                else:
+                    # Default to Small for seq_train_rfdetr_s paths
+                    if 'rfdetr_s' in path_lower:
+                        ModelClass = RFDETRSmall
+                    else:
+                        ModelClass = RFDETRBase
+                
+                print(f"Detected RF-DETR model: {ModelClass.__name__}")
+                
+                # Load with pretrained weights
+                model = ModelClass(pretrain_weights=path, num_classes=len(CLASS_MAP))
+                print("RF-DETR Model loaded.")
+                return model
+            else:
+                # YOLO Model
+                model = YOLO(path)
+                
+                # Warmup
+                print("Warming up YOLO model...")
+                dummy = np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
+                _ = model(dummy, device=self.device, half=self.half, verbose=False)
+                print("YOLO Model ready.")
+                return model
         except Exception as e:
             print(f"Error initializing model: {e}")
+            traceback.print_exc()
             raise
+
+    def _run_rfdetr_inference(self, img):
+        """
+        Runs RF-DETR inference and returns results in a format compatible with the tracking pipeline.
+        Returns a list of detection dicts with simulated track IDs.
+        """
+        try:
+            # Convert BGR to RGB for RF-DETR
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # RF-DETR predict method
+            detections = self.model.predict(img_rgb, threshold=CONF_THRESHOLD)
+            
+            results = []
+            
+            # RF-DETR returns a supervision.Detections object or similar
+            # We need to extract boxes, confidence, and class IDs
+            if hasattr(detections, 'xyxy'):
+                # Supervision Detections object
+                for i in range(len(detections.xyxy)):
+                    x1, y1, x2, y2 = detections.xyxy[i]
+                    conf = detections.confidence[i] if hasattr(detections, 'confidence') else 0.5
+                    cls_id = detections.class_id[i] if hasattr(detections, 'class_id') else 0
+                    
+                    # Check for normalized coordinates (0-1)
+                    if x2 <= 1.0 and y2 <= 1.0:
+                        h_img, w_img = img.shape[:2]
+                        x1 *= w_img
+                        x2 *= w_img
+                        y1 *= h_img
+                        y2 *= h_img
+                    
+                    # Convert to center format
+                    w = x2 - x1
+                    h = y2 - y1
+                    cx = x1 + w/2
+                    cy = y1 + h/2
+                    
+                    # Generate a pseudo track ID based on position (simple spatial hashing)
+                    # This is a workaround since RF-DETR doesn't have built-in tracking
+                    tid = int(cx / 50) * 100 + int(cy / 50)
+                    
+                    results.append({
+                        'id': tid,
+                        'cls': int(cls_id),
+                        'conf': float(conf),
+                        'xywh': np.array([cx, cy, w, h])
+                    })
+            elif isinstance(detections, list):
+                # List of prediction dicts
+                for i, det in enumerate(detections):
+                    if 'x' in det and 'width' in det:
+                        # Center format
+                        cx, cy = det['x'], det['y']
+                        w, h = det['width'], det['height']
+                    elif 'x_min' in det:
+                        # Corner format
+                        x1, y1 = det['x_min'], det['y_min']
+                        x2, y2 = det['x_max'], det['y_max']
+                        w = x2 - x1
+                        h = y2 - y1
+                        cx = x1 + w/2
+                        cy = y1 + h/2
+                    else:
+                        continue
+                    
+                    conf = det.get('confidence', 0.5)
+                    cls_id = det.get('class_id', det.get('class', 0))
+                    
+                    # Check for normalized coordinates
+                    if cx <= 1.0 and cy <= 1.0 and w <= 1.0:
+                         h_img, w_img = img.shape[:2]
+                         cx *= w_img
+                         cy *= h_img
+                         w *= w_img
+                         h *= h_img
+                    
+                    tid = int(cx / 50) * 100 + int(cy / 50)
+                    
+                    results.append({
+                        'id': tid,
+                        'cls': int(cls_id),
+                        'conf': float(conf),
+                        'xywh': np.array([cx, cy, w, h])
+                    })
+            
+            # Debug: Print first detection if available
+            if results and self.frame_count % 60 == 0:
+                print(f"DEBUG: RF-DETR Raw Detection 0: {results[0]}")
+            
+            return results
+        except Exception as e:
+            print(f"RF-DETR inference error: {e}")
+            traceback.print_exc()
+            return []
 
     def preprocess(self, frame):
         """
@@ -580,19 +786,17 @@ class Perception:
         current_objects = {} # ID -> Box
         
         if run_yolo and self.model is not None:
-            # --- YOLO STEP ---
-            results = self.model.track(img, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD, verbose=False, half=self.half, device=self.device, persist=True, tracker="bytetrack.yaml")
-            
-            if results and results[0].boxes:
-                for box in results[0].boxes:
-                    if box.id is None: continue
-                    tid = int(box.id[0])
-                    cls_id = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    xywh = box.xywh[0].cpu().numpy()
+            # --- DETECTION STEP ---
+            if self.is_rfdetr:
+                # RF-DETR Inference
+                rfdetr_results = self._run_rfdetr_inference(img)
+                
+                for det in rfdetr_results:
+                    tid = det['id']
+                    cls_id = det['cls']
+                    conf = det['conf']
+                    xywh = det['xywh']
                     
-                    # Motion Validation
-                    # Check if the box contains motion
                     x, y, w, h = xywh
                     x1, y1 = int(max(0, x - w/2)), int(max(0, y - h/2))
                     x2, y2 = int(min(INPUT_SIZE, x + w/2)), int(min(INPUT_SIZE, y + h/2))
@@ -603,23 +807,18 @@ class Perception:
                         if roi_motion.size > 0:
                             motion_score = cv2.countNonZero(roi_motion) / roi_motion.size
                     
-                    # Filter: If confidence is low (< 0.5) AND motion is low (< 0.05), discard
-                    # This allows keeping low-conf moving objects, but rejecting low-conf static ones
                     if conf < 0.5 and motion_score < 0.05:
                         continue
                     
-                    # Update/Create Tracker
                     tl_x, tl_y = x - w/2, y - h/2
                     bbox = (tl_x, tl_y, w, h)
                     
                     if tid not in self.object_state:
-                        # New Object
                         tracker = self._create_tracker()
                         if tracker:
                             tracker.init(img, bbox)
                         self.object_state[tid] = {'tracker': tracker, 'box': xywh, 'cls': cls_id, 'conf': conf, 'failures': 0}
                     else:
-                        # Existing Object - Re-initialize to correct drift
                         tracker = self.object_state[tid]['tracker']
                         if tracker:
                             tracker = self._create_tracker()
@@ -631,6 +830,58 @@ class Perception:
                         self.object_state[tid]['failures'] = 0
                         
                     current_objects[tid] = xywh
+            else:
+                # YOLO Tracking
+                results = self.model.track(img, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD, verbose=False, half=self.half, device=self.device, persist=True, tracker="bytetrack.yaml")
+            
+                if results and results[0].boxes:
+                    for box in results[0].boxes:
+                        if box.id is None: continue
+                        tid = int(box.id[0])
+                        cls_id = int(box.cls[0])
+                        conf = float(box.conf[0])
+                        xywh = box.xywh[0].cpu().numpy()
+                        
+                        # Motion Validation
+                        # Check if the box contains motion
+                        x, y, w, h = xywh
+                        x1, y1 = int(max(0, x - w/2)), int(max(0, y - h/2))
+                        x2, y2 = int(min(INPUT_SIZE, x + w/2)), int(min(INPUT_SIZE, y + h/2))
+                        
+                        motion_score = 0.0
+                        if self.motion_mask is not None:
+                            roi_motion = self.motion_mask[y1:y2, x1:x2]
+                            if roi_motion.size > 0:
+                                motion_score = cv2.countNonZero(roi_motion) / roi_motion.size
+                        
+                        # Filter: If confidence is low (< 0.5) AND motion is low (< 0.05), discard
+                        # This allows keeping low-conf moving objects, but rejecting low-conf static ones
+                        if conf < 0.5 and motion_score < 0.05:
+                            continue
+                        
+                        # Update/Create Tracker
+                        tl_x, tl_y = x - w/2, y - h/2
+                        bbox = (tl_x, tl_y, w, h)
+                        
+                        if tid not in self.object_state:
+                            # New Object
+                            tracker = self._create_tracker()
+                            if tracker:
+                                tracker.init(img, bbox)
+                            self.object_state[tid] = {'tracker': tracker, 'box': xywh, 'cls': cls_id, 'conf': conf, 'failures': 0}
+                        else:
+                            # Existing Object - Re-initialize to correct drift
+                            tracker = self.object_state[tid]['tracker']
+                            if tracker:
+                                tracker = self._create_tracker()
+                                if tracker:
+                                    tracker.init(img, bbox)
+                            self.object_state[tid]['tracker'] = tracker
+                            self.object_state[tid]['box'] = xywh
+                            self.object_state[tid]['conf'] = conf
+                            self.object_state[tid]['failures'] = 0
+                            
+                        current_objects[tid] = xywh
             
             # Remove stale objects
             seen_ids = set(current_objects.keys())

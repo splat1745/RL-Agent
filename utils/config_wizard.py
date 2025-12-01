@@ -124,38 +124,45 @@ class ConfigWizard:
             pass
 
     def validate_config(self):
-        """Checks if config exists and matches current resolution."""
+        """Checks if config exists and has a valid health ROI."""
         if not os.path.exists(CONFIG_FILE):
             return False
             
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
-                
-            if "resolution" not in data:
+            
+            # Check if health_roi exists and has valid bbox
+            if "health_roi" not in data:
+                return False
+            
+            if "bbox" not in data["health_roi"]:
                 return False
                 
-            saved_w, saved_h = data["resolution"]
-            
-            # Ensure capture is running to check resolution
-            if not self.capture.running:
-                self.capture.start()
-                # Wait for a frame
-                for _ in range(10):
-                    if self.capture.get_latest_frame() is not None:
-                        break
-                    time.sleep(0.1)
-                
-            frame = self.capture.get_latest_frame()
-            if frame is None:
-                print("Could not capture frame to validate resolution.")
-                return False 
-                
-            curr_h, curr_w = frame.shape[:2]
-            
-            if saved_w != curr_w or saved_h != curr_h:
-                print(f"Resolution changed (Saved: {saved_w}x{saved_h}, Current: {curr_w}x{curr_h}).")
+            bbox = data["health_roi"]["bbox"]
+            if len(bbox) != 4 or bbox[2] <= 0 or bbox[3] <= 0:
                 return False
+            
+            # Optional: Check resolution but only warn, don't invalidate
+            if "resolution" in data:
+                saved_w, saved_h = data["resolution"]
+                
+                # Ensure capture is running to check resolution
+                if not self.capture.running:
+                    self.capture.start()
+                    for _ in range(10):
+                        if self.capture.get_latest_frame() is not None:
+                            break
+                        time.sleep(0.1)
+                    
+                frame = self.capture.get_latest_frame()
+                if frame is not None:
+                    curr_h, curr_w = frame.shape[:2]
+                    
+                    if saved_w != curr_w or saved_h != curr_h:
+                        print(f"Warning: Resolution changed (Saved: {saved_w}x{saved_h}, Current: {curr_w}x{curr_h}).")
+                        print("Health bar position may need reconfiguration. Use --setup to reconfigure.")
+                        # Still return True - let user decide if they need to reconfigure
                 
             return True
         except Exception as e:

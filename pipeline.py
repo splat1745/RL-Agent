@@ -64,7 +64,8 @@ if not os.path.exists(DATA_ROOT):
         except OSError:
             pass
 
-print(f"Active Data Root: {DATA_ROOT}")
+if __name__ == "__main__":
+    print(f"Active Data Root: {DATA_ROOT}")
 
 FRAMES_DIR = os.path.join(DATA_ROOT, "frames")
 UPLOAD_DIR = os.path.join(DATA_ROOT, "roboflow_upload")
@@ -511,16 +512,23 @@ def train_sequential(model_type="rtdetr", model_size="l", explicit_datasets=None
                 
             # Train
             # Note: RF-DETR train() args might vary slightly by version, using standard ones
+            # Default workers to 8 for better GPU saturation
+            n_workers = workers if workers is not None else 8
+            
+            print(f"RF-DETR Config: Batch={batch_size if batch_size else 4}, Accum={grad_accum if grad_accum else 4}, Workers={n_workers}")
+            
             model.train(
                 dataset_dir=coco_path,
                 epochs=epochs,
-                batch_size=batch_size if batch_size else 4, # Conservative
+                batch_size=batch_size if batch_size else 4, # Conservative default
                 grad_accum_steps=grad_accum if grad_accum else 4,
-                num_workers=workers if workers is not None else 2,
+                num_workers=n_workers,
                 lr=1e-4,
                 output_dir=output_dir,
                 resume=current_weights if current_weights else None,
-                device=device if device else 'cuda'
+                device=device if device else 'cuda',
+                pin_memory=True, # Ensure fast transfer to GPU
+                persistent_workers=True # Keep workers alive to avoid respawn overhead
             )
             
             # 3. Update weights
