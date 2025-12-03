@@ -10,7 +10,13 @@ class TwoStreamNetwork(nn.Module):
         
         # --- 1. Full Frame Encoder (MobileNetV3 Large + Extra Layers) ---
         # Input: [Batch, 16, 160, 160] (4 frames * 4 channels RGBD)
-        self.full_encoder = models.mobilenet_v3_large(weights=None)
+        # Use pretrained weights for faster convergence
+        try:
+            weights = models.MobileNet_V3_Large_Weights.DEFAULT
+        except:
+            weights = 'DEFAULT' # Fallback for older versions or if enum not found
+            
+        self.full_encoder = models.mobilenet_v3_large(weights=weights)
         
         original_first_layer = self.full_encoder.features[0][0]
         self.full_encoder.features[0][0] = nn.Conv2d(
@@ -173,6 +179,14 @@ class TwoStreamNetwork(nn.Module):
                     nn.init.orthogonal_(param, gain=1.0)
                 elif 'bias' in name:
                     param.data.fill_(0.0)
+
+    def freeze_backbone(self):
+        """Freezes the pretrained MobileNet backbone to speed up training."""
+        for param in self.full_encoder.parameters():
+            param.requires_grad = False
+        # We can also freeze the extra layers if we want to rely purely on pretrained features
+        # But usually we want to train the adapter. Let's keep full_extra trainable for now.
+        print("Backbone (MobileNetV3) frozen. Gradients will not be computed for it.")
         
     def forward(self, full_frames, crop_frames, flow, vector_obs, hidden_state=None, seq_len=1, return_aux=False):
         """

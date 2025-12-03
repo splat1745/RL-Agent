@@ -160,13 +160,16 @@ def mixed_collate(batch):
         
     return collated
 
-def train(data_dir, output_model, epochs=10, batch_size=2, lr=1e-4):
+def train(data_dir, output_model, epochs=10, batch_size=2, lr=1e-4, accumulation_steps=16, freeze=False, seq_len=16):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on {device}")
     
+    # Optimize for fixed input sizes
+    torch.backends.cudnn.benchmark = True
+    
     # 1. Load Data
     # Pass device to dataset to enable GPU preloading
-    full_dataset = ImitationDataset(data_dir, seq_len=32, device=device) 
+    full_dataset = ImitationDataset(data_dir, seq_len=seq_len, device=device) 
     if len(full_dataset) == 0:
         print("No data found. Exiting.")
         return
@@ -184,6 +187,10 @@ def train(data_dir, output_model, epochs=10, batch_size=2, lr=1e-4):
     
     # 2. Initialize Agent
     agent = PPOAgent(action_dim=26, lr=lr)
+    
+    if freeze:
+        agent.policy.freeze_backbone()
+        
     agent.policy.train()
     
     # Calculate Class Weights (Use only training data to avoid leakage)
@@ -199,6 +206,10 @@ def train(data_dir, output_model, epochs=10, batch_size=2, lr=1e-4):
     counter = Counter(all_actions)
     total_samples = len(all_actions)
     num_classes = 26
+    
+    print("Top 5 Actions:")
+    for action, count in counter.most_common(5):
+        print(f"  Action {action}: {count} ({count/total_samples*100:.2f}%)")
     
     weights = torch.ones(num_classes).to(device)
     for cls_id in range(num_classes):
@@ -217,9 +228,18 @@ def train(data_dir, output_model, epochs=10, batch_size=2, lr=1e-4):
     mse_loss = nn.MSELoss()
     optimizer = optim.Adam(agent.policy.parameters(), lr=lr)
     
+    # Scheduler to reduce LR on plateau
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
+    
+    # Mixed Precision Scaler
+    scaler = torch.cuda.amp.GradScaler()
+    
     best_val_acc = 0.0
+    best_val_loss = float('inf')
     
     # 3. Training Loop
+    print(f"Starting training with Batch Size {batch_size} and Accumulation Steps {accumulation_steps} (Effective Batch: {batch_size * accumulation_steps})")
+    
     for epoch in range(epochs):
         # --- TRAIN ---
         agent.policy.train()
@@ -229,7 +249,9 @@ def train(data_dir, output_model, epochs=10, batch_size=2, lr=1e-4):
         train_total = 0
         batches = 0
         
-        for batch in train_loader:
+        optimizer.zero_grad()
+        
+        for i, batch in enumerate(train_loader):
             # Move to device (if not already there)
             full = batch['full'].to(device)
             crop = batch['crop'].to(device)
@@ -251,50 +273,66 @@ def train(data_dir, output_model, epochs=10, batch_size=2, lr=1e-4):
             c0 = torch.zeros(2, b, 768).to(device)
             hidden = (h0, c0)
             
-            optimizer.zero_grad()
+            # Mixed Precision Forward
+            with torch.cuda.amp.autocast():
+                # Forward with Aux
+                probs, _, _, _, pred_camera, pred_enemy, pred_next_vec = agent.policy(
+                    full_flat, crop_flat, flow_flat, vector_flat, 
+                    hidden_state=hidden, seq_len=s, return_aux=True
+                )
+                
+                # Main Action Loss
+                loss_action = criterion(probs, targets_flat)
+                
+                # Accuracy Calc
+                _, predicted = torch.max(probs, 1)
+                
+                # --- Auxiliary Losses ---
+                target_camera = vector_flat[:, 25:27]
+                loss_camera = mse_loss(pred_camera, target_camera)
+                
+                target_enemy = vector_flat[:, 4:6]
+                loss_enemy = mse_loss(pred_enemy, target_enemy)
+                
+                pred_next_vec_seq = pred_next_vec.view(b, s, -1)
+                vector_seq = vector.view(b, s, -1)
+                
+                loss_dynamics = 0
+                if s > 1:
+                    pred_steps = pred_next_vec_seq[:, :-1, :]
+                    target_steps = vector_seq[:, 1:, :]
+                    loss_dynamics = mse_loss(pred_steps, target_steps)
+                
+                # Total Loss
+                loss = loss_action + 0.1 * loss_camera + 0.1 * loss_enemy + 0.1 * loss_dynamics
+                
+                # Normalize loss for accumulation
+                loss = loss / accumulation_steps
             
-            # Forward with Aux
-            probs, _, _, _, pred_camera, pred_enemy, pred_next_vec = agent.policy(
-                full_flat, crop_flat, flow_flat, vector_flat, 
-                hidden_state=hidden, seq_len=s, return_aux=True
-            )
+            # Mixed Precision Backward
+            scaler.scale(loss).backward()
             
-            # Main Action Loss
-            loss_action = criterion(probs, targets_flat)
+            # Step Optimizer
+            if (i + 1) % accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
             
-            # Accuracy Calc
-            _, predicted = torch.max(probs, 1)
+            # Stats (Move to CPU for logging to avoid sync)
             train_correct += (predicted == targets_flat).sum().item()
             train_total += targets_flat.size(0)
-            
-            # --- Auxiliary Losses ---
-            target_camera = vector_flat[:, 25:27]
-            loss_camera = mse_loss(pred_camera, target_camera)
-            
-            target_enemy = vector_flat[:, 4:6]
-            loss_enemy = mse_loss(pred_enemy, target_enemy)
-            
-            pred_next_vec_seq = pred_next_vec.view(b, s, -1)
-            vector_seq = vector.view(b, s, -1)
-            
-            loss_dynamics = 0
-            if s > 1:
-                pred_steps = pred_next_vec_seq[:, :-1, :]
-                target_steps = vector_seq[:, 1:, :]
-                loss_dynamics = mse_loss(pred_steps, target_steps)
-            
-            # Total Loss
-            loss = loss_action + 0.1 * loss_camera + 0.1 * loss_enemy + 0.1 * loss_dynamics
-            
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
+            total_loss += loss.item() * accumulation_steps 
             
             # Handle scalar 0 for loss_dynamics if s <= 1
             dyn_val = loss_dynamics.item() if isinstance(loss_dynamics, torch.Tensor) else 0
             total_aux_loss += (loss_camera.item() + loss_enemy.item() + dyn_val)
             batches += 1
+            
+        # Step for any remaining gradients
+        if len(train_loader) % accumulation_steps != 0:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
             
         avg_loss = total_loss / batches if batches > 0 else 0
         avg_aux = total_aux_loss / batches if batches > 0 else 0
@@ -343,14 +381,19 @@ def train(data_dir, output_model, epochs=10, batch_size=2, lr=1e-4):
         avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
         val_acc = 100 * val_correct / val_total if val_total > 0 else 0
         
+        # Step Scheduler
+        scheduler.step(val_acc)
+        
         print(f"Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f} (Aux: {avg_aux:.4f}) | Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}% | Val Loss: {avg_val_loss:.4f}")
         
         # Save Latest
         agent.save(output_model)
         
         # Save Best
-        if val_acc > best_val_acc:
+        # Check if accuracy improved OR if accuracy is same but loss improved
+        if val_acc > best_val_acc or (val_acc == best_val_acc and avg_val_loss < best_val_loss):
             best_val_acc = val_acc
+            best_val_loss = avg_val_loss
             best_name = output_model.replace(".pth", "_best.pth")
             agent.save(best_name)
             print(f"New Best Model! Saved to {best_name}")
@@ -360,6 +403,10 @@ if __name__ == "__main__":
     parser.add_argument("--data", type=str, default="data/imitation", help="Path to imitation data")
     parser.add_argument("--out", type=str, default="ppo_agent_imitation.pth", help="Output model path")
     parser.add_argument("--epochs", type=int, default=20, help="Number of epochs")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size per step")
+    parser.add_argument("--accumulate", type=int, default=16, help="Gradient accumulation steps")
+    parser.add_argument("--freeze", action="store_true", help="Freeze the MobileNet backbone")
+    parser.add_argument("--seq_len", type=int, default=16, help="Sequence length for LSTM")
     args = parser.parse_args()
     
-    train(args.data, args.out, args.epochs)
+    train(args.data, args.out, args.epochs, args.batch_size, accumulation_steps=args.accumulate, freeze=args.freeze, seq_len=args.seq_len)
