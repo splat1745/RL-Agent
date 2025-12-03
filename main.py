@@ -301,9 +301,16 @@ def imitation_loop(state_manager, controller):
             # Save periodically
             if step_count % save_interval == 0:
                 filename = f"{data_dir}/session_{session_id}_part_{step_count // save_interval}.pkl"
+                temp_filename = filename + ".tmp"
                 print(f"Saving {len(recorded_data)} steps to {filename}...")
-                with open(filename, 'wb') as f:
+                
+                # Write to temp file first (Atomic Write)
+                with open(temp_filename, 'wb') as f:
                     pickle.dump(recorded_data, f)
+                
+                # Rename to final .pkl (Sync loop will only see it now)
+                os.replace(temp_filename, filename)
+                
                 recorded_data = [] # Clear buffer
 
     except Exception as e:
@@ -312,9 +319,13 @@ def imitation_loop(state_manager, controller):
         # Save remaining data
         if recorded_data:
             filename = f"{data_dir}/session_{session_id}_final.pkl"
+            temp_filename = filename + ".tmp"
             print(f"Saving final {len(recorded_data)} steps to {filename}...")
-            with open(filename, 'wb') as f:
+            
+            with open(temp_filename, 'wb') as f:
                 pickle.dump(recorded_data, f)
+            os.replace(temp_filename, filename)
+            
         print("Imitation Loop Ended.")
 
 def main():
@@ -404,6 +415,11 @@ def main():
     capture_service.focus()
     time.sleep(0.3)
     
+    # Hot Reload State
+    last_model_mtime = 0
+    if agent_model_path and os.path.exists(agent_model_path):
+        last_model_mtime = os.path.getmtime(agent_model_path)
+    
     # 4. Preview Mode
     mode = preview_detection(perception, capture_service)
     
@@ -412,6 +428,10 @@ def main():
         agent_thread = threading.Thread(target=agent_loop, args=(agent, memory, controller, state_manager, 10, model_path))
         agent_thread.daemon = True
         agent_thread.start()
+        
+        # Hot Reload Loop (in Main Thread)
+        # We check for model updates while the visualization runs
+        
     elif mode == "direct":
         # 5. Start Direct Policy Thread
         policy = DirectPolicy()
@@ -469,6 +489,18 @@ def main():
                 current_action, current_reward, current_intention = status_queue.get_nowait()
             except queue.Empty:
                 pass
+            
+            # --- Hot Reload Check ---
+            if agent_model_path and os.path.exists(agent_model_path):
+                try:
+                    mtime = os.path.getmtime(agent_model_path)
+                    if mtime > last_model_mtime:
+                        print(f"New model detected! Reloading from {agent_model_path}...")
+                        agent.load(agent_model_path)
+                        last_model_mtime = mtime
+                        print("Model reloaded successfully.")
+                except Exception as e:
+                    print(f"Hot reload failed: {e}")
             
             # 3. Visualization
             # Draw every frame or every few frames

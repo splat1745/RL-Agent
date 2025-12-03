@@ -12,13 +12,17 @@ import gc
 from collections import Counter
 
 class ImitationDataset(Dataset):
-    def __init__(self, data_dir, seq_len=64, device=None):
+    def __init__(self, data_dir, seq_len=64, device=None, file_list=None):
         self.data = []
         self.seq_len = seq_len
         self.device = device if device is not None else torch.device('cpu')
         self.gpu_full = False
         
-        files = glob.glob(os.path.join(data_dir, "*.pkl"))
+        if file_list is not None:
+            files = file_list
+        else:
+            files = glob.glob(os.path.join(data_dir, "*.pkl"))
+            
         print(f"Found {len(files)} data files.")
         
         total_steps = 0
@@ -39,11 +43,12 @@ class ImitationDataset(Dataset):
                             
                             # Try GPU
                             if not self.gpu_full:
-                                # Check memory safety margin (leave ~30% free for training overhead)
+                                # Check memory safety margin (leave ~40% free for training overhead)
                                 if self.device.type == 'cuda':
                                     total = torch.cuda.get_device_properties(self.device).total_memory
                                     allocated = torch.cuda.memory_allocated(self.device)
-                                    if allocated > total * 0.95:
+                                    # Reduced threshold from 0.95 to 0.60 for stability on smaller GPUs
+                                    if allocated > total * 0.60:
                                         self.gpu_full = True
                                         print(f"GPU Memory threshold reached ({allocated/1024**3:.2f} GB). Switching to CPU.")
                                         self.data.append(processed_seq)
