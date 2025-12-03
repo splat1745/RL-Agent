@@ -9,6 +9,7 @@ import numpy as np
 from rl.agent import PPOAgent
 import argparse
 import gc
+from collections import Counter
 
 class ImitationDataset(Dataset):
     def __init__(self, data_dir, seq_len=64, device=None):
@@ -78,11 +79,47 @@ class ImitationDataset(Dataset):
 
     def _process_sequence(self, seq):
         # Collate sequence data into tensors
-        full = np.array([s['pixel_obs']['full'] for s in seq])
-        crop = np.array([s['pixel_obs']['crop'] for s in seq])
-        flow = np.array([s['pixel_obs']['flow'] for s in seq])
-        vector = np.array([s['vector_obs'] for s in seq])
-        actions = np.array([s['action'] for s in seq])
+        # Decompress from uint8/float16 to float32 if needed
+        
+        full_list = []
+        crop_list = []
+        flow_list = []
+        vector_list = []
+        action_list = []
+        
+        for s in seq:
+            # Decompress Full: uint8 [0-255] -> float32 [0.0-1.0]
+            # If already float (old data), just cast
+            f_raw = s['pixel_obs']['full']
+            if f_raw.dtype == np.uint8:
+                f = f_raw.astype(np.float32) / 255.0
+            else:
+                f = f_raw.astype(np.float32)
+            full_list.append(f)
+            
+            # Decompress Crop: uint8 [0-255] -> float32 [0.0-1.0]
+            c_raw = s['pixel_obs']['crop']
+            if c_raw.dtype == np.uint8:
+                c = c_raw.astype(np.float32) / 255.0
+            else:
+                c = c_raw.astype(np.float32)
+            crop_list.append(c)
+            
+            # Decompress Flow: float16 -> float32
+            fl = s['pixel_obs']['flow'].astype(np.float32)
+            flow_list.append(fl)
+            
+            # Decompress Vector: float16 -> float32
+            v = s['vector_obs'].astype(np.float32)
+            vector_list.append(v)
+            
+            action_list.append(s['action'])
+            
+        full = np.array(full_list)
+        crop = np.array(crop_list)
+        flow = np.array(flow_list)
+        vector = np.array(vector_list)
+        actions = np.array(action_list)
         
         return {
             'full': torch.FloatTensor(full),
@@ -129,29 +166,70 @@ def train(data_dir, output_model, epochs=10, batch_size=2, lr=1e-4):
     
     # 1. Load Data
     # Pass device to dataset to enable GPU preloading
-    dataset = ImitationDataset(data_dir, seq_len=32, device=device) 
-    if len(dataset) == 0:
+    full_dataset = ImitationDataset(data_dir, seq_len=32, device=device) 
+    if len(full_dataset) == 0:
         print("No data found. Exiting.")
         return
 
+    # Split Train/Val (85% Train, 15% Val)
+    val_size = int(len(full_dataset) * 0.15)
+    train_size = len(full_dataset) - val_size
+    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
+    
+    print(f"Training on {train_size} sequences, Validating on {val_size} sequences.")
+
     # Use custom collate to handle mixed GPU/CPU batches
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=mixed_collate)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=mixed_collate)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=mixed_collate)
     
     # 2. Initialize Agent
     agent = PPOAgent(action_dim=26, lr=lr)
     agent.policy.train()
     
-    criterion = nn.CrossEntropyLoss()
+    # Calculate Class Weights (Use only training data to avoid leakage)
+    print("Calculating class weights from training set...")
+    all_actions = []
+    # We need to iterate the subset. random_split returns a Subset object.
+    # Subset.dataset is the original, Subset.indices are the indices.
+    for idx in train_dataset.indices:
+        seq = full_dataset.data[idx]
+        actions = seq['actions'].cpu().numpy()
+        all_actions.extend(actions)
+        
+    counter = Counter(all_actions)
+    total_samples = len(all_actions)
+    num_classes = 26
+    
+    weights = torch.ones(num_classes).to(device)
+    for cls_id in range(num_classes):
+        count = counter.get(cls_id, 0)
+        if count > 0:
+            # Inverse frequency
+            weights[cls_id] = total_samples / (count * num_classes)
+        else:
+            weights[cls_id] = 1.0
+            
+    # Normalize weights
+    weights = weights / weights.mean()
+    print(f"Class Weights: {weights}")
+    
+    criterion = nn.CrossEntropyLoss(weight=weights)
     mse_loss = nn.MSELoss()
     optimizer = optim.Adam(agent.policy.parameters(), lr=lr)
     
+    best_val_acc = 0.0
+    
     # 3. Training Loop
     for epoch in range(epochs):
+        # --- TRAIN ---
+        agent.policy.train()
         total_loss = 0
         total_aux_loss = 0
+        train_correct = 0
+        train_total = 0
         batches = 0
         
-        for batch in dataloader:
+        for batch in train_loader:
             # Move to device (if not already there)
             full = batch['full'].to(device)
             crop = batch['crop'].to(device)
@@ -184,31 +262,20 @@ def train(data_dir, output_model, epochs=10, batch_size=2, lr=1e-4):
             # Main Action Loss
             loss_action = criterion(probs, targets_flat)
             
+            # Accuracy Calc
+            _, predicted = torch.max(probs, 1)
+            train_correct += (predicted == targets_flat).sum().item()
+            train_total += targets_flat.size(0)
+            
             # --- Auxiliary Losses ---
-            # 1. Camera Motion (Indices 25, 26 in vector_obs)
-            # Target: vector_flat[:, 25:27]
             target_camera = vector_flat[:, 25:27]
             loss_camera = mse_loss(pred_camera, target_camera)
             
-            # 2. Enemy Position (Indices 4, 5 in vector_obs)
-            # Target: vector_flat[:, 4:6]
             target_enemy = vector_flat[:, 4:6]
             loss_enemy = mse_loss(pred_enemy, target_enemy)
             
-            # 3. Forward Dynamics (Next State Prediction)
-            # Target: vector_flat shifted by 1.
-            # We predict state[t+1] from state[t].
-            # Since we flattened [Batch, Seq], we need to be careful.
-            # We can reshape back to [Batch, Seq, Dim] to shift.
             pred_next_vec_seq = pred_next_vec.view(b, s, -1)
             vector_seq = vector.view(b, s, -1)
-            
-            # Predict t+1 from t.
-            # Pred[t] should match Vector[t+1]
-            # We ignore the last prediction (for t=N) and last target (t=0)
-            # Actually:
-            # Input at t -> Output Pred[t] -> Target Vector[t+1]
-            # So we compare Pred[:, :-1] with Vector[:, 1:]
             
             loss_dynamics = 0
             if s > 1:
@@ -217,8 +284,7 @@ def train(data_dir, output_model, epochs=10, batch_size=2, lr=1e-4):
                 loss_dynamics = mse_loss(pred_steps, target_steps)
             
             # Total Loss
-            # Weight auxiliary losses
-            loss = loss_action + 0.5 * loss_camera + 0.5 * loss_enemy + 0.5 * loss_dynamics
+            loss = loss_action + 0.1 * loss_camera + 0.1 * loss_enemy + 0.1 * loss_dynamics
             
             loss.backward()
             optimizer.step()
@@ -232,11 +298,62 @@ def train(data_dir, output_model, epochs=10, batch_size=2, lr=1e-4):
             
         avg_loss = total_loss / batches if batches > 0 else 0
         avg_aux = total_aux_loss / batches if batches > 0 else 0
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f} (Aux: {avg_aux:.4f})")
+        train_acc = 100 * train_correct / train_total if train_total > 0 else 0
         
-        # Save checkpoint
+        # --- VALIDATION ---
+        agent.policy.eval()
+        val_correct = 0
+        val_total = 0
+        val_loss = 0
+        val_batches = 0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                full = batch['full'].to(device)
+                crop = batch['crop'].to(device)
+                flow = batch['flow'].to(device)
+                vector = batch['vector'].to(device)
+                targets = batch['actions'].to(device)
+                
+                b, s, c, h, w = full.shape
+                
+                full_flat = full.view(-1, *full.shape[2:])
+                crop_flat = crop.view(-1, *crop.shape[2:])
+                flow_flat = flow.view(-1, *flow.shape[2:])
+                vector_flat = vector.view(-1, *vector.shape[2:])
+                targets_flat = targets.view(-1)
+                
+                h0 = torch.zeros(2, b, 768).to(device)
+                c0 = torch.zeros(2, b, 768).to(device)
+                hidden = (h0, c0)
+                
+                probs, _, _, _ = agent.policy(
+                    full_flat, crop_flat, flow_flat, vector_flat, 
+                    hidden_state=hidden, seq_len=s, return_aux=False
+                )
+                
+                loss = criterion(probs, targets_flat)
+                val_loss += loss.item()
+                
+                _, predicted = torch.max(probs, 1)
+                val_correct += (predicted == targets_flat).sum().item()
+                val_total += targets_flat.size(0)
+                val_batches += 1
+                
+        avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
+        val_acc = 100 * val_correct / val_total if val_total > 0 else 0
+        
+        print(f"Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f} (Aux: {avg_aux:.4f}) | Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}% | Val Loss: {avg_val_loss:.4f}")
+        
+        # Save Latest
         agent.save(output_model)
-        print(f"Saved model to {output_model}")
+        
+        # Save Best
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_name = output_model.replace(".pth", "_best.pth")
+            agent.save(best_name)
+            print(f"New Best Model! Saved to {best_name}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

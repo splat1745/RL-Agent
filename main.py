@@ -273,11 +273,17 @@ def imitation_loop(state_manager, controller):
             reward = calculate_reward(vector_obs, action_idx, state_manager)
             
             # Store Data
-            # We store: (pixel_obs, vector_obs, action_idx, reward)
-            # pixel_obs is a dict, vector_obs is array
+            # Compress to uint8/float16 to save space (4x reduction)
+            # pixel_obs is 0.0-1.0 float32. We convert to 0-255 uint8.
+            compressed_obs = {
+                'full': (pixel_obs['full'] * 255).astype(np.uint8),
+                'crop': (pixel_obs['crop'] * 255).astype(np.uint8),
+                'flow': pixel_obs['flow'].astype(np.float16) # Flow can be negative, keep float16
+            }
+            
             recorded_data.append({
-                'pixel_obs': pixel_obs,
-                'vector_obs': vector_obs,
+                'pixel_obs': compressed_obs,
+                'vector_obs': vector_obs.astype(np.float16), # Compress vector too
                 'action': action_idx,
                 'reward': reward
             })
