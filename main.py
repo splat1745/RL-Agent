@@ -18,9 +18,13 @@ from utils.config_wizard import ConfigWizard, CONFIG_FILE
 from utils.state import StateManager
 
 from control.policy import DirectPolicy
+from control.input_listener import InputListener
+import datetime
+import pickle
+
 
 def preview_detection(perception, capture_service):
-    print("Starting Preview. Press 's' to start Agent, 'd' for Direct Policy, 'p' to quit.")
+    print("Starting Preview. Press 's' to start Agent, 'd' for Direct Policy, 'i' for Imitation Mode, 'p' to quit.")
     fps_start_time = time.time()
     fps_counter = 0
     fps = 0
@@ -95,6 +99,14 @@ def preview_detection(perception, capture_service):
             except:
                 pass
             return "direct"
+        elif key == ord('i'):
+            print("Starting Imitation Mode...")
+            cv2.destroyWindow("Preview (Press 's' to Start)")
+            try:
+                cv2.destroyWindow("ROI Logic Preview")
+            except:
+                pass
+            return "imitation"
         elif key == ord('p'):
             print("Quitting...")
             capture_service.stop()
@@ -226,6 +238,79 @@ def agent_loop(agent, memory, controller, state_manager, update_timestep, model_
             print(f"Saving model to {model_path}...")
             agent.save(model_path)
 
+def imitation_loop(state_manager, controller):
+    """
+    Records user inputs and observations for imitation learning.
+    """
+    print("Imitation Mode Started. Recording...")
+    listener = InputListener()
+    
+    # Data Storage
+    recorded_data = []
+    save_interval = 1000
+    step_count = 0
+    
+    # Create session ID
+    session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    data_dir = "data/imitation"
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+        
+    try:
+        while not stop_event.is_set():
+            try:
+                # Get latest observation
+                obs_data = obs_queue.get(timeout=0.1)
+                pixel_obs, vector_obs = obs_data
+            except queue.Empty:
+                continue
+                
+            # Get User Action
+            action_idx = listener.get_user_action()
+            action_name = get_action_name(action_idx)
+            
+            # Calculate Reward (for logging/verification)
+            reward = calculate_reward(vector_obs, action_idx, state_manager)
+            
+            # Store Data
+            # We store: (pixel_obs, vector_obs, action_idx, reward)
+            # pixel_obs is a dict, vector_obs is array
+            recorded_data.append({
+                'pixel_obs': pixel_obs,
+                'vector_obs': vector_obs,
+                'action': action_idx,
+                'reward': reward
+            })
+            
+            # Update Status for Visualization
+            if status_queue.full():
+                try:
+                    status_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            status_queue.put((f"REC: {action_name}", reward, None))
+            
+            step_count += 1
+            
+            # Save periodically
+            if step_count % save_interval == 0:
+                filename = f"{data_dir}/session_{session_id}_part_{step_count // save_interval}.pkl"
+                print(f"Saving {len(recorded_data)} steps to {filename}...")
+                with open(filename, 'wb') as f:
+                    pickle.dump(recorded_data, f)
+                recorded_data = [] # Clear buffer
+
+    except Exception as e:
+        print(f"Error in imitation loop: {e}")
+    finally:
+        # Save remaining data
+        if recorded_data:
+            filename = f"{data_dir}/session_{session_id}_final.pkl"
+            print(f"Saving final {len(recorded_data)} steps to {filename}...")
+            with open(filename, 'wb') as f:
+                pickle.dump(recorded_data, f)
+        print("Imitation Loop Ended.")
+
 def main():
     print("--- Auto-Farmer RL Agent ---")
     
@@ -234,10 +319,14 @@ def main():
     parser.add_argument("--setup", "-s", action="store_true", help="Force run the setup wizard")
     parser.add_argument("--model", "-m", type=str, default=None, 
                         help="Path to detection model (.pt for YOLO, .pth for RF-DETR)")
+    parser.add_argument("--agent-model", type=str, default=None, help="Path to pretrained RL agent model")
+    parser.add_argument("--fast", action="store_true", help="Enable FP8 precision (Fast Mode)")
     args = parser.parse_args()
     
     force_setup = args.setup
     detection_model_path = args.model
+    agent_model_path = args.agent_model
+    fast_mode = args.fast
     
     if detection_model_path:
         print(f"Using detection model: {detection_model_path}")
@@ -260,7 +349,7 @@ def main():
     
     # 2. Initialize Components
     print("Initializing Perception...")
-    perception = init_perception(detection_model_path)
+    perception = init_perception(detection_model_path, fast_mode=fast_mode)
     
     print("Initializing Agent...")
     # Action Dim = 26 (Updated)
@@ -279,8 +368,18 @@ def main():
     agent = PPOAgent(action_dim=26)
     
     # Load existing model
-    model_path = "ppo_agent_pixel.pth" # Changed name to avoid conflict
-    if os.path.exists(model_path):
+    # Priority: CLI Argument > Default File
+    model_path = "ppo_agent_pixel.pth" 
+    
+    if agent_model_path and os.path.exists(agent_model_path):
+        print(f"Loading pretrained agent from {agent_model_path}...")
+        try:
+            agent.load(agent_model_path)
+            model_path = agent_model_path # Save back to this file if we continue training? Or keep separate?
+            # Let's keep saving to the default or a new file to avoid overwriting the base
+        except Exception as e:
+            print(f"Error loading agent model: {e}")
+    elif os.path.exists(model_path):
         print(f"Loading existing model from {model_path}...")
         try:
             # agent.load(model_path)
@@ -311,6 +410,11 @@ def main():
         # 5. Start Direct Policy Thread
         policy = DirectPolicy()
         agent_thread = threading.Thread(target=direct_policy_loop, args=(policy, controller, state_manager))
+        agent_thread.daemon = True
+        agent_thread.start()
+    elif mode == "imitation":
+        # 5. Start Imitation Thread
+        agent_thread = threading.Thread(target=imitation_loop, args=(state_manager, controller))
         agent_thread.daemon = True
         agent_thread.start()
     

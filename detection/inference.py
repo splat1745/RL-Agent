@@ -105,10 +105,15 @@ class SimpleTracker:
         return True, self.bbox
 
 class Perception:
-    def __init__(self, model_path=MODEL_PATH, device=DEVICE, half=HALF_PRECISION):
+    def __init__(self, model_path=MODEL_PATH, device=DEVICE, half=HALF_PRECISION, fast_mode=False):
         self.device = device
         self.half = half
+        self.fast_mode = fast_mode
         self.model = self._init_model(model_path)
+        
+        # Optimization
+        if self.device == 'cuda':
+            torch.backends.cudnn.benchmark = True
         
         # Tracking / Velocity State
         self.player_history = deque(maxlen=3) # Store (cx, cy, time)
@@ -260,6 +265,8 @@ class Perception:
         self.crop_stack = deque(maxlen=4)  # Stores last 4 crops (96x96)
         self.last_gray = None # For optical flow
         self.last_depth_vis = None # For visualization
+        self.last_depth_map = None
+        self.depth_interval = 5 # Run depth estimation every 5 frames
         
         # --- New Logic State ---
         self.brightness_history = defaultdict(lambda: deque(maxlen=5))
@@ -462,7 +469,54 @@ class Perception:
                 
                 # Load with pretrained weights
                 model = ModelClass(pretrain_weights=path, num_classes=len(CLASS_MAP))
-                print("RF-DETR Model loaded.")
+                
+                # Move to device and set precision
+                # RF-DETR wrapper structure: model -> model.model -> model.model.model (nn.Module)
+                try:
+                    fp8_success = False
+                    if hasattr(model, 'model') and hasattr(model.model, 'model'):
+                        internal_model = model.model.model
+                        if hasattr(internal_model, 'to'):
+                            internal_model.to(self.device)
+                            
+                            # Fast Mode Optimization
+                            if self.fast_mode:
+                                print("Fast Mode Enabled: Using FP16 and torch.compile (if available).")
+                                # Note: Native FP8 (float8_e4m3fn) is skipped because 'addmm_cuda' is not implemented 
+                                # for this dtype on the current setup, causing crashes.
+                                
+                                # Apply torch.compile for speed
+                                if hasattr(torch, 'compile'):
+                                    print("Enabling torch.compile() for extra speed...")
+                                    try:
+                                        # Compile the internal model
+                                        # mode="reduce-overhead" is best for small batch inference
+                                        self.model.model.model = torch.compile(internal_model, mode="reduce-overhead")
+                                    except Exception as e:
+                                        print(f"torch.compile failed: {e}")
+
+                            if self.half:
+                                internal_model.half()
+                                print(f"Moved internal RF-DETR model to {self.device} (FP16={self.half})")
+                        
+                        # Update wrapper device reference if it exists
+                        if hasattr(model.model, 'device'):
+                            model.model.device = self.device
+                            
+                    # Optimize for inference
+                    if hasattr(model, 'optimize_for_inference'):
+                        dtype = torch.float16 if self.half else torch.float32
+                        # Note: optimize_for_inference might re-compile, so we do it after moving
+                        try:
+                            model.optimize_for_inference(dtype=dtype)
+                            print("RF-DETR optimized for inference.")
+                        except Exception as opt_e:
+                            print(f"Warning: Could not optimize RF-DETR: {opt_e}")
+                            
+                except Exception as e:
+                    print(f"Warning: Could not move RF-DETR to device: {e}")
+                
+                print(f"RF-DETR Model loaded.")
                 return model
             else:
                 # YOLO Model
@@ -1592,6 +1646,10 @@ class Perception:
         if self.depth_model is None or self.depth_transform is None:
             return np.zeros(frame.shape[:2], dtype=np.float32)
             
+        # Optimization: Cache depth map
+        if self.frame_count % self.depth_interval != 0 and self.last_depth_map is not None:
+            return self.last_depth_map
+
         try:
             # Optimization: Resize frame to smaller size for faster inference
             # MiDaS Small works well with 256x256 or 384x384
@@ -1618,7 +1676,8 @@ class Perception:
                 depth_map = (depth_map - depth_min) / (depth_max - depth_min)
             else:
                 depth_map = np.zeros_like(depth_map)
-                
+            
+            self.last_depth_map = depth_map
             return depth_map
         except Exception as e:
             # print(f"Depth Error: {e}")
@@ -2197,13 +2256,13 @@ class Perception:
 # Global instance
 perception_pipeline = None
 
-def init_perception(model_path=None):
+def init_perception(model_path=None, fast_mode=False):
     global perception_pipeline
     if perception_pipeline is None:
         if model_path:
-            perception_pipeline = Perception(model_path=model_path)
+            perception_pipeline = Perception(model_path=model_path, fast_mode=fast_mode)
         else:
-            perception_pipeline = Perception()
+            perception_pipeline = Perception(fast_mode=fast_mode)
     return perception_pipeline
 
 if __name__ == "__main__":
