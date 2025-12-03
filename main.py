@@ -250,11 +250,23 @@ def imitation_loop(state_manager, controller):
     save_interval = 1000
     step_count = 0
     
-    # Create session ID
-    session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     data_dir = "data/imitation"
     if not os.path.exists(data_dir):
         os.makedirs(data_dir)
+
+    # Find next available index
+    existing_files = [f for f in os.listdir(data_dir) if f.startswith("data_") and f.endswith(".pkl")]
+    max_idx = 0
+    for f in existing_files:
+        try:
+            idx = int(f.split("_")[1].split(".")[0])
+            if idx > max_idx:
+                max_idx = idx
+        except:
+            pass
+    
+    current_file_idx = max_idx + 1
+    print(f"Starting recording at index {current_file_idx}...")
         
     try:
         while not stop_event.is_set():
@@ -300,7 +312,7 @@ def imitation_loop(state_manager, controller):
             
             # Save periodically
             if step_count % save_interval == 0:
-                filename = f"{data_dir}/session_{session_id}_part_{step_count // save_interval}.pkl"
+                filename = f"{data_dir}/data_{current_file_idx}.pkl"
                 temp_filename = filename + ".tmp"
                 print(f"Saving {len(recorded_data)} steps to {filename}...")
                 
@@ -312,13 +324,14 @@ def imitation_loop(state_manager, controller):
                 os.replace(temp_filename, filename)
                 
                 recorded_data = [] # Clear buffer
+                current_file_idx += 1
 
     except Exception as e:
         print(f"Error in imitation loop: {e}")
     finally:
         # Save remaining data
         if recorded_data:
-            filename = f"{data_dir}/session_{session_id}_final.pkl"
+            filename = f"{data_dir}/data_{current_file_idx}.pkl"
             temp_filename = filename + ".tmp"
             print(f"Saving final {len(recorded_data)} steps to {filename}...")
             

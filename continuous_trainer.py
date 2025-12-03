@@ -53,48 +53,66 @@ def continuous_train(data_dir, model_path, device_name="cuda"):
             print(f"Mixing in {len(replay_files)} old files for replay.")
             
         training_files = new_files + replay_files
+        random.shuffle(training_files) # Shuffle order
         
-        # 2. Load Data
-        dataset = ImitationDataset(data_dir, seq_len=16, device=device, file_list=training_files)
+        print(f"Starting Sequential Training on {len(training_files)} files...")
         
-        if len(dataset) == 0:
-            print("Dataset is empty (possibly due to corrupted files). Skipping training round.")
-            time.sleep(5)
-            continue
-        
-        loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=mixed_collate)
-        
-        # 3. Train (Few epochs on the new data)
-        optimizer = torch.optim.Adam(agent.policy.parameters(), lr=1e-4)
-        
-        print("Training...")
-        for epoch in range(5): # Quick updates
-            total_loss = 0
-            for batch in loader:
-                # ... (Simplified training loop) ...
-                full = batch['full'].to(device)
-                crop = batch['crop'].to(device)
-                flow = batch['flow'].to(device)
-                vector = batch['vector'].to(device)
-                targets = batch['actions'].to(device)
-                
-                full_flat = full.view(-1, *full.shape[2:])
-                crop_flat = crop.view(-1, *crop.shape[2:])
-                flow_flat = flow.view(-1, *flow.shape[2:])
-                vector_flat = vector.view(-1, *vector.shape[2:])
-                targets_flat = targets.view(-1)
-                
-                optimizer.zero_grad()
-                # Policy returns 4 values by default: probs, value, hidden, aux/intention
-                probs, _, _, _ = agent.policy(full_flat, crop_flat, flow_flat, vector_flat, seq_len=batch['full'].shape[1])
-                loss = torch.nn.functional.cross_entropy(probs, targets_flat)
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
+        # 2. Sequential Training Loop
+        for f_idx, f_path in enumerate(training_files):
+            print(f"[{f_idx+1}/{len(training_files)}] Loading {os.path.basename(f_path)}...")
             
-            print(f"  Update Epoch {epoch+1}: Loss {total_loss/len(loader):.4f}")
+            # Load SINGLE file
+            try:
+                dataset = ImitationDataset(data_dir, seq_len=16, device=device, file_list=[f_path])
+            except Exception as e:
+                print(f"Failed to load {f_path}: {e}")
+                continue
+                
+            if len(dataset) == 0:
+                print("  Empty dataset, skipping.")
+                continue
             
-        # 4. Save Model
+            loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=mixed_collate)
+            
+            # 3. Train (Few epochs per file)
+            optimizer = torch.optim.Adam(agent.policy.parameters(), lr=1e-4)
+            
+            for epoch in range(2): # Reduced epochs per file since we iterate many
+                total_loss = 0
+                batches = 0
+                for batch in loader:
+                    full = batch['full'].to(device)
+                    crop = batch['crop'].to(device)
+                    flow = batch['flow'].to(device)
+                    vector = batch['vector'].to(device)
+                    targets = batch['actions'].to(device)
+                    
+                    full_flat = full.view(-1, *full.shape[2:])
+                    crop_flat = crop.view(-1, *crop.shape[2:])
+                    flow_flat = flow.view(-1, *flow.shape[2:])
+                    vector_flat = vector.view(-1, *vector.shape[2:])
+                    targets_flat = targets.view(-1)
+                    
+                    optimizer.zero_grad()
+                    # Policy returns 4 values: probs, value, hidden, aux/intention
+                    probs, _, _, _ = agent.policy(full_flat, crop_flat, flow_flat, vector_flat, seq_len=batch['full'].shape[1])
+                    loss = torch.nn.functional.cross_entropy(probs, targets_flat)
+                    loss.backward()
+                    optimizer.step()
+                    total_loss += loss.item()
+                    batches += 1
+                
+                if batches > 0:
+                    print(f"  Epoch {epoch+1}: Loss {total_loss/batches:.4f}")
+            
+            # Cleanup Memory Immediately
+            del dataset
+            del loader
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+        # 4. Save Model (After batch is done)
         print(f"Saving updated model to {model_path}...")
         agent.save(model_path)
         
