@@ -133,6 +133,32 @@ class TwoStreamNetwork(nn.Module):
             nn.Linear(256, 1)
         )
         
+        # --- Auxiliary Heads (For Imitation Learning) ---
+        # 1. Camera Motion Prediction (From Flow)
+        # Predicts g_dx, g_dy (2 dims)
+        self.aux_camera_head = nn.Sequential(
+            nn.Linear(self.flow_feature_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2)
+        )
+        
+        # 2. Enemy Position Prediction (From Full Frame)
+        # Predicts enemy_dx, enemy_dy (2 dims)
+        self.aux_enemy_head = nn.Sequential(
+            nn.Linear(self.full_feature_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 2)
+        )
+        
+        # 3. Forward Dynamics (Next State Prediction)
+        # Predicts next vector_obs (151 dims) from LSTM state + Action Embedding
+        # Note: We don't have action embedding here yet, so we predict from LSTM state (which implies action intent)
+        self.aux_dynamics_head = nn.Sequential(
+            nn.Linear(768, 512),
+            nn.ReLU(),
+            nn.Linear(512, vector_dim)
+        )
+        
         # Initialize Weights
         self.apply(self._init_weights)
 
@@ -148,10 +174,11 @@ class TwoStreamNetwork(nn.Module):
                 elif 'bias' in name:
                     param.data.fill_(0.0)
         
-    def forward(self, full_frames, crop_frames, flow, vector_obs, hidden_state=None, seq_len=1):
+    def forward(self, full_frames, crop_frames, flow, vector_obs, hidden_state=None, seq_len=1, return_aux=False):
         """
         full_frames: [Batch*Seq, C, H, W]
         seq_len: Length of sequence (default 1 for inference)
+        return_aux: If True, returns auxiliary predictions
         """
         # 1. Encode Full Frames
         x_full = self.full_encoder.features(full_frames)
@@ -200,6 +227,14 @@ class TwoStreamNetwork(nn.Module):
         
         action_probs = self.final_action_layer(merged_feat)
         value = self.critic(lstm_out_flat)
+        
+        if return_aux:
+            # Auxiliary Predictions
+            pred_camera = self.aux_camera_head(x_flow) # [Batch*Seq, 2]
+            pred_enemy = self.aux_enemy_head(x_full)   # [Batch*Seq, 2]
+            pred_next_vec = self.aux_dynamics_head(lstm_out_flat) # [Batch*Seq, 151]
+            
+            return action_probs, value, new_hidden, intention, pred_camera, pred_enemy, pred_next_vec
         
         return action_probs, value, new_hidden, intention
 
