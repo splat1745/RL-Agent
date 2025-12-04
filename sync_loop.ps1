@@ -1,7 +1,7 @@
 $User = "underdog"
 $IP = "192.168.0.8"
 $RemotePath = "~/Auto-Farmer"
-$LocalData = "data/imitation"
+$LocalData = "D:\Auto-Farmer-Data\imitation_train"
 
 # Ensure local directory exists
 if (-not (Test-Path $LocalData)) {

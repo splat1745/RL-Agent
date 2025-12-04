@@ -250,7 +250,7 @@ def imitation_loop(state_manager, controller):
     save_interval = 1000
     step_count = 0
     
-    data_dir = "data/imitation"
+    data_dir = r"D:\Auto-Farmer-Data\imitation_train"
     if not os.path.exists(data_dir):
         os.makedirs(data_dir)
 

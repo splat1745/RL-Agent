@@ -52,4 +52,4 @@ def analyze_data(data_dir):
         print(f"Action {action_id}: {weights[action_id]:.4f}")
 
 if __name__ == "__main__":
-    analyze_data("data/imitation")
+    analyze_data(r"D:\Auto-Farmer-Data\imitation_train")
