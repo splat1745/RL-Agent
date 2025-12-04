@@ -23,12 +23,14 @@ def continuous_train(data_dir, model_path, device_name="cuda"):
     agent.policy.to(device)
     agent.policy.train()
     
+    # Load processed files history
+    processed_log_path = "processed_files.txt"
     processed_files = set()
-    
-    # Initial scan to mark existing files as processed (optional, or train on them first)
-    # existing = glob.glob(os.path.join(data_dir, "*.pkl"))
-    # for f in existing:
-    #     processed_files.add(f)
+    if os.path.exists(processed_log_path):
+        with open(processed_log_path, "r") as f:
+            for line in f:
+                processed_files.add(line.strip())
+        print(f"Loaded {len(processed_files)} processed files from history.")
     
     # Convert set to list for sampling
     processed_list = list(processed_files)
@@ -39,7 +41,8 @@ def continuous_train(data_dir, model_path, device_name="cuda"):
         all_files = glob.glob(os.path.join(data_dir, "*.pkl"))
         # Use set for fast lookup
         processed_set = set(processed_list)
-        new_files = [f for f in all_files if f not in processed_set]
+        # Filter out files that are already processed
+        new_files = [f for f in all_files if os.path.abspath(f) not in processed_set and f not in processed_set]
         
         if not new_files:
             time.sleep(5)
@@ -87,7 +90,7 @@ def continuous_train(data_dir, model_path, device_name="cuda"):
             optimizer = torch.optim.Adam(agent.policy.parameters(), lr=1e-4)
             accumulation_steps = 16
             
-            for epoch in range(2): # Reduced epochs per file since we iterate many
+            for epoch in range(27): # Reduced epochs per file since we iterate many
                 total_loss = 0
                 batches = 0
                 optimizer.zero_grad()
@@ -140,8 +143,10 @@ def continuous_train(data_dir, model_path, device_name="cuda"):
         agent.save(model_path)
         
         # Mark as processed
-        for f in new_files:
-            processed_list.append(f)
+        with open(processed_log_path, "a") as f:
+            for f_path in new_files:
+                processed_list.append(f_path)
+                f.write(f"{f_path}\n")
             
         print("Waiting for more data...")
 
