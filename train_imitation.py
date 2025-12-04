@@ -48,7 +48,7 @@ class ImitationDataset(Dataset):
                                     total = torch.cuda.get_device_properties(self.device).total_memory
                                     allocated = torch.cuda.memory_allocated(self.device)
                                     # Reduced threshold from 0.95 to 0.60 for stability on smaller GPUs
-                                    if allocated > total * 0.60:
+                                    if allocated > total * 0.70:
                                         self.gpu_full = True
                                         print(f"GPU Memory threshold reached ({allocated/1024**3:.2f} GB). Switching to CPU.")
                                         self.data.append(processed_seq)

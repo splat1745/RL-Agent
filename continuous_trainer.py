@@ -1,4 +1,7 @@
 import os
+# Set allocator config to reduce fragmentation
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
 import time
 import glob
 import torch
@@ -57,30 +60,38 @@ def continuous_train(data_dir, model_path, device_name="cuda"):
         
         print(f"Starting Sequential Training on {len(training_files)} files...")
         
-        # 2. Sequential Training Loop
-        for f_idx, f_path in enumerate(training_files):
-            print(f"[{f_idx+1}/{len(training_files)}] Loading {os.path.basename(f_path)}...")
+        # 2. Chunked Training Loop
+        # Process files in batches to fill GPU without crashing
+        chunk_size = 5 
+        for i in range(0, len(training_files), chunk_size):
+            chunk = training_files[i : i + chunk_size]
+            print(f"Processing Chunk {i//chunk_size + 1} ({len(chunk)} files)...")
             
-            # Load SINGLE file
+            # Load Chunk
             try:
-                dataset = ImitationDataset(data_dir, seq_len=16, device=device, file_list=[f_path])
+                # Try to load into GPU first (up to 85%), then spill to CPU
+                dataset = ImitationDataset(data_dir, seq_len=16, device=device, file_list=chunk)
             except Exception as e:
-                print(f"Failed to load {f_path}: {e}")
+                print(f"Failed to load chunk: {e}")
                 continue
                 
             if len(dataset) == 0:
                 print("  Empty dataset, skipping.")
                 continue
             
-            loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=mixed_collate)
+            # Reduced batch size to 2 for stability
+            loader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=mixed_collate)
             
-            # 3. Train (Few epochs per file)
+            # 3. Train (Few epochs per chunk)
             optimizer = torch.optim.Adam(agent.policy.parameters(), lr=1e-4)
+            accumulation_steps = 16
             
             for epoch in range(2): # Reduced epochs per file since we iterate many
                 total_loss = 0
                 batches = 0
-                for batch in loader:
+                optimizer.zero_grad()
+                
+                for i, batch in enumerate(loader):
                     full = batch['full'].to(device)
                     crop = batch['crop'].to(device)
                     flow = batch['flow'].to(device)
@@ -93,14 +104,25 @@ def continuous_train(data_dir, model_path, device_name="cuda"):
                     vector_flat = vector.view(-1, *vector.shape[2:])
                     targets_flat = targets.view(-1)
                     
-                    optimizer.zero_grad()
                     # Policy returns 4 values: probs, value, hidden, aux/intention
                     probs, _, _, _ = agent.policy(full_flat, crop_flat, flow_flat, vector_flat, seq_len=batch['full'].shape[1])
                     loss = torch.nn.functional.cross_entropy(probs, targets_flat)
+                    
+                    # Normalize loss for accumulation
+                    loss = loss / accumulation_steps
                     loss.backward()
-                    optimizer.step()
-                    total_loss += loss.item()
+                    
+                    if (i + 1) % accumulation_steps == 0:
+                        optimizer.step()
+                        optimizer.zero_grad()
+                    
+                    total_loss += loss.item() * accumulation_steps
                     batches += 1
+                
+                # Step for remaining gradients
+                if batches % accumulation_steps != 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
                 
                 if batches > 0:
                     print(f"  Epoch {epoch+1}: Loss {total_loss/batches:.4f}")

@@ -1,5 +1,5 @@
 $User = "underdog"
-$IP = "192.168.1.198"
+$IP = "192.168.0.8"
 $RemotePath = "~/Auto-Farmer"
 $LocalData = "data/imitation"
 
