@@ -28,7 +28,8 @@ class ImitationDataset(Dataset):
         total_steps = 0
         gpu_steps = 0
         
-        for f_path in files:
+        for idx, f_path in enumerate(files):
+            print(f"  [Dataset] Loading file {idx+1}/{len(files)}: {os.path.basename(f_path)}...")
             try:
                 with open(f_path, 'rb') as f:
                     session_data = pickle.load(f)

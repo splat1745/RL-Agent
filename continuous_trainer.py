@@ -83,6 +83,7 @@ def continuous_train(data_dir, model_path, device_name="cuda"):
             loader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=mixed_collate)
             
             # 3. Train (Few epochs per chunk)
+            print(f"  Starting training on chunk with {len(dataset)} sequences...")
             optimizer = torch.optim.Adam(agent.policy.parameters(), lr=1e-4)
             accumulation_steps = 16
             
