@@ -1,5 +1,20 @@
-$User = "underdog"
-$IP = "192.168.0.8"
+$LoginInfo = ".\LinUser.txt"
+
+if (Test-Path $LoginInfo) {
+    $lines = @(Get-Content $LoginInfo)
+    if ($lines.Count -ge 2) {
+        $User = $lines[0].Trim()
+        $IP = $lines[1].Trim()
+        $Password = if ($lines.Count -ge 3) { $lines[2].Trim() } else { "Unknown" }
+    } else {
+        Write-Host "Error: LinUser.txt must have at least 2 lines (User, IP)." -ForegroundColor Red
+        exit 1
+    }
+} else {
+    Write-Host "Error: LinUser.txt not found. Please create it with User, IP, and Password on separate lines." -ForegroundColor Red
+    exit 1
+}
+
 $RemotePath = "~/Auto-Farmer"
 $LocalData = "D:\Auto-Farmer-Data\imitation_train"
 
@@ -10,9 +25,32 @@ if (-not (Test-Path $LocalData)) {
 
 # Keep track of sent files to avoid re-uploading
 $SentFiles = @{}
+$LogFile = "uploaded_files.log"
+
+if (Test-Path $LogFile) {
+    Get-Content $LogFile | ForEach-Object { $SentFiles[$_] = $true }
+    Write-Host "Loaded $($SentFiles.Count) uploaded files from history."
+} else {
+    # Try to fetch existing files from remote to avoid initial re-upload
+    Write-Host "No history found. Checking remote files..."
+    try {
+        $RemoteFiles = ssh ${User}@${IP} "ls ${RemotePath}/data/imitation/"
+        if ($?) {
+            foreach ($file in $RemoteFiles) {
+                if ($file -like "*.pkl") {
+                    $SentFiles[$file] = $true
+                    Add-Content -Path $LogFile -Value $file
+                }
+            }
+            Write-Host "Discovered $($SentFiles.Count) files already on remote."
+        }
+    } catch {
+        Write-Host "Could not check remote files. Will upload all local files."
+    }
+}
 
 Write-Host "Starting Sync Loop with $IP..."
-Write-Host "Password: AboudBeast@2011$"
+Write-Host "Password: $Password"
 
 while ($true) {
     # 1. Find new .pkl files
@@ -28,6 +66,7 @@ while ($true) {
             
             if ($?) { 
                 $SentFiles[$File.Name] = $true 
+                Add-Content -Path $LogFile -Value $File.Name
             } else {
                 Write-Host "Failed to upload $($File.Name)" -ForegroundColor Red
             }

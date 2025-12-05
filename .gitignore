@@ -11,6 +11,11 @@ weights
 # Ignore logs and run directories
 runs
 logs
+*.log
+
+# Ignore secondary personal machine files
+*.8
+
 # Ignore virtual environment directories
 venv
 env

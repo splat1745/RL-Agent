@@ -6,14 +6,22 @@ import time
 import glob
 import torch
 import argparse
+import re
 from rl.agent import PPOAgent
 from train_imitation import ImitationDataset, mixed_collate
 from torch.utils.data import DataLoader
 
+def natural_keys(text):
+    '''
+    alist.sort(key=natural_keys) sorts in human order
+    http://nedbatchelder.com/blog/200712/human_sorting.html
+    '''
+    return [int(c) if c.isdigit() else c for c in re.split(r'(\d+)', text)]
+
 def continuous_train(data_dir, model_path, device_name="cuda"):
     device = torch.device(device_name if torch.cuda.is_available() else "cpu")
     print(f"Continuous Trainer started on {device}...")
-    print(f"Watching {data_dir} for new data...")
+    print(f"Watching {data_dir} (Absolute: {os.path.abspath(data_dir)}) for *.pkl files...")
     
     # Initialize Agent
     agent = PPOAgent(action_dim=26)
@@ -30,7 +38,8 @@ def continuous_train(data_dir, model_path, device_name="cuda"):
         with open(processed_log_path, "r") as f:
             for line in f:
                 processed_files.add(line.strip())
-        print(f"Loaded {len(processed_files)} processed files from history.")
+    
+    print(f"Loaded {len(processed_files)} processed files from history.")
     
     # Convert set to list for sampling
     processed_list = list(processed_files)
@@ -39,16 +48,29 @@ def continuous_train(data_dir, model_path, device_name="cuda"):
     while True:
         # 1. Find new files
         all_files = glob.glob(os.path.join(data_dir, "*.pkl"))
-        # Use set for fast lookup
-        processed_set = set(processed_list)
-        # Filter out files that are already processed
-        new_files = [f for f in all_files if os.path.abspath(f) not in processed_set and f not in processed_set]
+        all_files.sort(key=natural_keys) # Sort naturally (data_1, data_2, ... data_10)
+        
+        if len(all_files) == 0:
+             print(f"No .pkl files found in {data_dir}. Waiting...")
+             time.sleep(5)
+             continue
+
+        # Use basenames for robust comparison (avoids path differences)
+        processed_basenames = set()
+        for p in processed_files:
+            processed_basenames.add(os.path.basename(p))
+            
+        new_files = []
+        for f in all_files:
+            if os.path.basename(f) not in processed_basenames:
+                new_files.append(f)
         
         if not new_files:
+            print(f"No new files. Watching {len(all_files)} total files. (Last seen: {os.path.basename(all_files[-1]) if all_files else 'None'})")
             time.sleep(5)
             continue
             
-        print(f"Found {len(new_files)} new data files.")
+        print(f"Found {len(new_files)} new data files: {[os.path.basename(f) for f in new_files]}")
         
         # --- Replay Logic ---
         # Mix new files with up to 5 random old files to prevent forgetting
@@ -63,6 +85,8 @@ def continuous_train(data_dir, model_path, device_name="cuda"):
         
         print(f"Starting Sequential Training on {len(training_files)} files...")
         
+        successfully_processed = set()
+        
         # 2. Chunked Training Loop
         # Process files in batches to fill GPU without crashing
         chunk_size = 5 
@@ -72,8 +96,14 @@ def continuous_train(data_dir, model_path, device_name="cuda"):
             
             # Load Chunk
             try:
-                # Try to load into GPU first (up to 85%), then spill to CPU
+                # Try to load into GPU first (up to 70%), then spill to CPU
                 dataset = ImitationDataset(data_dir, seq_len=16, device=device, file_list=chunk)
+                
+                # Track successful loads
+                if hasattr(dataset, 'successfully_loaded_files'):
+                    for f in dataset.successfully_loaded_files:
+                        successfully_processed.add(os.path.abspath(f))
+                        
             except Exception as e:
                 print(f"Failed to load chunk: {e}")
                 continue
@@ -145,8 +175,13 @@ def continuous_train(data_dir, model_path, device_name="cuda"):
         # Mark as processed
         with open(processed_log_path, "a") as f:
             for f_path in new_files:
-                processed_list.append(f_path)
-                f.write(f"{f_path}\n")
+                # Only mark if it was successfully loaded
+                if os.path.abspath(f_path) in successfully_processed:
+                    processed_files.add(f_path)
+                    processed_list.append(f_path)
+                    f.write(f"{f_path}\n")
+                else:
+                    print(f"Skipping mark for {os.path.basename(f_path)} (failed to load). Will retry next loop.")
             
         print("Waiting for more data...")
 

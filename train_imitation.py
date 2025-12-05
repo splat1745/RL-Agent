@@ -17,6 +17,7 @@ class ImitationDataset(Dataset):
         self.seq_len = seq_len
         self.device = device if device is not None else torch.device('cpu')
         self.gpu_full = False
+        self.successfully_loaded_files = []
         
         if file_list is not None:
             files = file_list
@@ -34,6 +35,9 @@ class ImitationDataset(Dataset):
                 with open(f_path, 'rb') as f:
                     session_data = pickle.load(f)
                     if not session_data: continue
+                    
+                    # Mark as successful if we opened and loaded it
+                    self.successfully_loaded_files.append(f_path)
                     
                     # Split session into sequences
                     for i in range(0, len(session_data) - seq_len, seq_len):
