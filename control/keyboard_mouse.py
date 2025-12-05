@@ -161,58 +161,11 @@ class InputController:
             time.sleep(duration)
             return
         
-        if action_name == "click":
+        if action_name == "click" or action_name == "m1":
             click()
-            time.sleep(duration)
+            time.sleep(0.1)
             return
             
-        if action_name == "m1_3": # 3x M1 (Replaces Click)
-            click()
-            time.sleep(0.1)
-            click()
-            time.sleep(0.1)
-            click()
-            time.sleep(duration)
-            return
-
-        if action_name == "reg_m4": # 4x M1
-            for _ in range(4):
-                click()
-                time.sleep(0.1)
-            time.sleep(duration)
-            return
-
-        if action_name == "down_m1": # 3x M1 + Space + M1
-            # 3x M1
-            for _ in range(3):
-                click()
-                time.sleep(0.1)
-            # Space
-            press_key(DIK_SPACE)
-            time.sleep(0.05)
-            release_key(DIK_SPACE)
-            time.sleep(0.1)
-            # M1
-            click()
-            time.sleep(duration)
-            return
-
-        if action_name == "up_m1": # 3x M1 + Hold Space + M1
-            # 3x M1
-            for _ in range(3):
-                click()
-                time.sleep(0.1)
-            # Hold Space
-            press_key(DIK_SPACE)
-            time.sleep(0.1)
-            # M1
-            click()
-            time.sleep(0.1)
-            # Release Space
-            release_key(DIK_SPACE)
-            time.sleep(duration)
-            return
-
         # Evasive Actions (Q + Direction)
         if action_name == "dash_left":
             press_key(DIK_A)
@@ -253,22 +206,10 @@ class InputController:
         # Combos
         # r_1 removed
 
-        if action_name == "r_2":
-            # R + 2: Press R, then 2
-            press_key(DIK_R)
-            time.sleep(0.05)
-            self._press("2")
-            time.sleep(0.05)
-            self._release("2")
-            time.sleep(0.05)
-            release_key(DIK_R)
-            time.sleep(duration)
-            return
-
         # Explicit Tap for Skills (1-4, F, R, G)
         if action_name in ["1", "2", "3", "4", "f", "r", "g"]:
             self._press(action_name)
-            time.sleep(0.05) # Short press
+            time.sleep(0.09) # Short press
             self._release(action_name)
             time.sleep(duration)
             return

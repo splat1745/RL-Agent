@@ -269,10 +269,12 @@ class Perception:
         self.depth_interval = 5 # Run depth estimation every 5 frames
         
         # --- New Logic State ---
+        # --- New Logic State ---
         self.brightness_history = defaultdict(lambda: deque(maxlen=5))
         self.ragdoll_counters = defaultdict(int)
         self.last_player_health = 1.0
         self.filtered_health = 1.0
+        self.object_duration = {} # ID -> frames persisted
 
         # --- Optimization & Advanced Hit Detection ---
         # Check if tracker is available
@@ -1001,6 +1003,33 @@ class Perception:
                 if tid in current_objects:
                     del current_objects[tid]
 
+        # --- STABILITY FILTER ---
+        # Update Durations
+        # Only pass objects that have existed for > 1.0 second (approx 30 frames at 30fps)
+        valid_objects = {}
+        
+        for tid, xywh in current_objects.items():
+            if tid not in self.object_duration:
+                self.object_duration[tid] = 0
+            
+            self.object_duration[tid] += 1
+            
+            # Threshold: 30 frames (approx 1s)
+            # Exception: Player is always valid if found
+            is_player_candidate = (CLASS_MAP.get(self.object_state[tid]['cls']) == "character") # We need to be careful not to filter player if it's new
+            # Actually, player selection happens later. 
+            # If we filter here, we might lose the player.
+            # But we want to filter "labels created".
+            
+            # Let's just track stable flags but pass everything to the logic that finds player.
+            # Then filter the "enemies" list.
+            
+            is_stable = self.object_duration[tid] > 30
+            self.object_state[tid]['is_stable'] = is_stable
+            
+            if is_stable:
+               valid_objects[tid] = xywh
+
         # --- CONSTRUCT OUTPUT ---
         det_dict = {
             "player": None,
@@ -1014,10 +1043,14 @@ class Perception:
         
         character_candidates = []
         
+        # Use ALL objects for Player candidate search (player might be new)
+        # But use VALID/STABLE objects for enemies/others
+        
         for tid, xywh in current_objects.items():
             state = self.object_state[tid]
             cls_id = state['cls']
             conf = state['conf']
+            is_stable = state.get('is_stable', False)
             
             # Update History
             self.track_histories[tid].append(xywh[:2])
@@ -1025,9 +1058,10 @@ class Perception:
             label = CLASS_MAP.get(cls_id, "unknown")
             
             if label == "character":
-                character_candidates.append((tid, xywh, conf))
-            elif label == "throwable":
-                # "make item detection confidence 100%" -> Only accept if conf is extremely high (effectively disabling it)
+                # Add to candidates for player identification
+                character_candidates.append((tid, xywh, conf, is_stable))
+            elif label == "throwable" and is_stable:
+                 # "make item detection confidence 100%" -> Only accept if conf is extremely high (effectively disabling it)
                 if conf > 0.99:
                     det_dict["items"].append(xywh)
 
@@ -1038,7 +1072,7 @@ class Perception:
         best_score = float('inf')
         player_candidate = None
         
-        for tid, xywh, conf in character_candidates:
+        for tid, xywh, conf, is_stable in character_candidates:
             hist = self.track_histories[tid]
             cx, cy = xywh[:2]
             dist_to_center = np.linalg.norm(np.array([cx, cy]) - target_center)
@@ -1052,6 +1086,7 @@ class Perception:
             if score < best_score:
                 best_score = score
                 player_candidate = (tid, xywh, conf)
+
         
         # Health Logic
         raw_health = self.get_health(frame)
@@ -1080,8 +1115,12 @@ class Perception:
             det_dict["player"] = (p_xywh[0], p_xywh[1], p_xywh[2], p_xywh[3], p_conf, p_damage_visual, p_ragdoll)
             
             # Enemies
-            for tid, xywh, conf in character_candidates:
+            for tid, xywh, conf, is_stable in character_candidates:
                 if tid != pid:
+                    # ONLY Include Stable Enemies
+                    if not is_stable:
+                        continue
+                        
                     # Analyze Enemy
                     state_str = self.analyze_enemy(tid, xywh, p_xywh, img)
                     

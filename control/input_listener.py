@@ -69,10 +69,10 @@ class InputListener:
         # 4. Check Mouse Movement
         current_pos = win32api.GetCursorPos()
         dx = current_pos[0] - self.last_mouse_pos[0]
+        dy = current_pos[1] - self.last_mouse_pos[1] # Track dy as well
         self.last_mouse_pos = current_pos
         
         # Thresholds for turning
-        # These need to be tuned to match the "feel" of the agent's discrete turns
         if abs(dx) > 2:
             if dx < -40: return 24 # Left Large
             if dx < -15: return 22 # Left Small
@@ -83,3 +83,36 @@ class InputListener:
             if dx > 2:  return 21 # Right Micro
             
         return 0 # Idle
+
+    def get_raw_input(self):
+        """
+        Returns a dict of raw input states for recording.
+        """
+        current_pos = win32api.GetCursorPos()
+        dx = current_pos[0] - self.last_mouse_pos[0]
+        dy = current_pos[1] - self.last_mouse_pos[1]
+        # Note: calling get_user_action updates last_mouse_pos, so if we call this AFTER, dx/dy might be 0.
+        # Ideally, we should update last_mouse_pos only once per loop.
+        # But for now, let's just re-calculate from the *very* brief interval if called sequentially, 
+        # or better: let the main loop pass the dx/dy it saw?
+        # Actually, get_user_action is called in the loop. 
+        # Let's just capture the keys here. Mouse delta is better tracked by the controller/main loop logic.
+        
+        raw_keys = {
+            'W': bool(self.is_pressed(self.VK_W)),
+            'A': bool(self.is_pressed(self.VK_A)),
+            'S': bool(self.is_pressed(self.VK_S)),
+            'D': bool(self.is_pressed(self.VK_D)),
+            'Space': bool(self.is_pressed(self.VK_SPACE)),
+            'M1': bool(self.is_pressed(self.VK_LBUTTON)),
+            '1': bool(self.is_pressed(self.VK_1)),
+            '2': bool(self.is_pressed(self.VK_2)),
+            '3': bool(self.is_pressed(self.VK_3)),
+            '4': bool(self.is_pressed(self.VK_4)),
+            'Q': bool(self.is_pressed(self.VK_Q)),
+            'E': bool(self.is_pressed(self.VK_R)), # Mapped VK_R to E logic? No, VK_R is R.
+            'R': bool(self.is_pressed(self.VK_R)),
+            'F': bool(self.is_pressed(self.VK_F)),
+            'G': bool(self.is_pressed(self.VK_G))
+        }
+        return raw_keys

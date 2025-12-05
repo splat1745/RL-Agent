@@ -1,22 +1,10 @@
-$LoginInfo = ".\LinUser.txt"
-
-if (Test-Path $LoginInfo) {
-    $lines = @(Get-Content $LoginInfo)
-    if ($lines.Count -ge 2) {
-        $User = $lines[0].Trim()
-        $IP = $lines[1].Trim()
-        $Password = if ($lines.Count -ge 3) { $lines[2].Trim() } else { "Unknown" }
-    } else {
-        Write-Host "Error: LinUser.txt must have at least 2 lines (User, IP)." -ForegroundColor Red
-        exit 1
-    }
-} else {
-    Write-Host "Error: LinUser.txt not found. Please create it with User, IP, and Password on separate lines." -ForegroundColor Red
-    exit 1
-}
+$User = "underdog"
+$IP = "192.168.0.173"
+$Password = "AboudBeast@2011$"
 
 $RemotePath = "~/Auto-Farmer"
-$LocalData = "D:\Auto-Farmer-Data\imitation_train"
+# Syncing RL Trajectories
+$LocalData = "D:\Auto-Farmer-Data\rl_train"
 
 # Ensure local directory exists
 if (-not (Test-Path $LocalData)) {
@@ -25,7 +13,7 @@ if (-not (Test-Path $LocalData)) {
 
 # Keep track of sent files to avoid re-uploading
 $SentFiles = @{}
-$LogFile = "uploaded_files.log"
+$LogFile = "uploaded_traj.log"
 
 if (Test-Path $LogFile) {
     Get-Content $LogFile | ForEach-Object { $SentFiles[$_] = $true }
@@ -34,10 +22,11 @@ if (Test-Path $LogFile) {
     # Try to fetch existing files from remote to avoid initial re-upload
     Write-Host "No history found. Checking remote files..."
     try {
-        $RemoteFiles = ssh ${User}@${IP} "ls ${RemotePath}/data/imitation/"
+        # Check files in rl_train/
+        $RemoteFiles = ssh ${User}@${IP} "ls ${RemotePath}/data/rl_train/"
         if ($?) {
             foreach ($file in $RemoteFiles) {
-                if ($file -like "*.pkl") {
+                if ($file -like "traj_*.pkl") {
                     $SentFiles[$file] = $true
                     Add-Content -Path $LogFile -Value $file
                 }
@@ -54,7 +43,7 @@ Write-Host "Password: $Password"
 
 while ($true) {
     # 1. Find new .pkl files
-    $Files = Get-ChildItem $LocalData -Filter "*.pkl"
+    $Files = Get-ChildItem $LocalData -Filter "traj_*.pkl"
     $NewFiles = $Files | Where-Object { -not $SentFiles.ContainsKey($_.Name) }
 
     if ($NewFiles) {
@@ -62,7 +51,8 @@ while ($true) {
         foreach ($File in $NewFiles) {
             Write-Host "Uploading $($File.Name)..."
             # Suppress output for cleaner log
-            scp $File.FullName ${User}@${IP}:${RemotePath}/data/imitation/
+            # Use data/rl_train/
+            scp $File.FullName ${User}@${IP}:${RemotePath}/data/rl_train/
             
             if ($?) { 
                 $SentFiles[$File.Name] = $true 
@@ -74,15 +64,15 @@ while ($true) {
     }
 
     # 2. Pull updated model
-    # We only want to pull if the remote file is newer, but scp doesn't check timestamps easily.
-    # We'll just pull it. It's one file.
+    # Pull ppo_agent.pth -> ppo_agent_new.pth
     Write-Host "Checking for model update..."
-    scp -q ${User}@${IP}:${RemotePath}/ppo_agent_imitation.pth .
+    # Suppress output (-q)
+    scp -q ${User}@${IP}:${RemotePath}/ppo_agent.pth ./ppo_agent_new.pth
     
     if ($?) {
-        Write-Host "Model synced." -ForegroundColor Green
+        Write-Host "Model upgrade downloaded! (ppo_agent_new.pth)" -ForegroundColor Green
     }
 
-    Write-Host "Sleeping for 30 seconds..."
-    Start-Sleep -Seconds 30
+    Write-Host "Sleeping for 10 seconds..."
+    Start-Sleep -Seconds 10
 }

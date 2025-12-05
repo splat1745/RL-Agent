@@ -147,7 +147,16 @@ class PPOAgent:
         self.policy_old.load_state_dict(self.policy.state_dict())
     
     def save(self, filename):
-        torch.save(self.policy.state_dict(), filename)
+        import os
+        tmp_filename = filename + ".tmp"
+        torch.save(self.policy.state_dict(), tmp_filename)
+        try:
+            os.replace(tmp_filename, filename)
+        except OSError:
+            # Fallback for some windows cases or if file is locked
+            if os.path.exists(filename):
+                os.remove(filename)
+            os.rename(tmp_filename, filename)
         
     def load(self, filename):
         saved_state = torch.load(filename)

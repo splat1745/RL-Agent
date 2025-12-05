@@ -136,7 +136,10 @@ def direct_policy_loop(policy, controller, state_manager):
         try:
             # Get latest observation (blocking with timeout)
             obs_data = obs_queue.get(timeout=0.1)
-            pixel_obs, vector_obs = obs_data
+            if len(obs_data) == 3:
+                pixel_obs, vector_obs, _ = obs_data
+            else:
+                pixel_obs, vector_obs = obs_data
         except queue.Empty:
             continue
             
@@ -177,9 +180,12 @@ def agent_loop(agent, memory, controller, state_manager, update_timestep, model_
     while not stop_event.is_set():
         try:
             # Get latest observation (blocking with timeout)
-            # Queue now returns (pixel_obs, vector_obs)
+            # Queue now returns (pixel_obs, vector_obs, det_dict)
             obs_data = obs_queue.get(timeout=0.1)
-            pixel_obs, vector_obs = obs_data
+            if len(obs_data) == 3:
+                pixel_obs, vector_obs, _ = obs_data
+            else:
+                pixel_obs, vector_obs = obs_data
         except queue.Empty:
             continue
             
@@ -213,25 +219,85 @@ def agent_loop(agent, memory, controller, state_manager, update_timestep, model_
         status_queue.put((action_name, reward, intention))
         
         # 6. Store in Memory
-        # Store tuple of (pixel_obs, vector_obs)
-        memory.states.append((pixel_obs, vector_obs))
+        # Compress pixel_obs to uint8 to save Memory and Disk Space
+        compressed_obs = {
+            'full': (pixel_obs['full'] * 255).astype(np.uint8),
+            'crop': (pixel_obs['crop'] * 255).astype(np.uint8),
+            'flow': pixel_obs['flow'].astype(np.float16)
+        }
+        
+        # Store tuple of (compressed_obs, vector_obs)
+        memory.states.append((compressed_obs, vector_obs.astype(np.float16)))
         memory.actions.append(action_idx)
         memory.logprobs.append(log_prob)
         memory.rewards.append(reward)
-        memory.is_terminals.append(False) # Never terminal for now
+        memory.is_terminals.append(False) 
         
         time_step += 1
         running_reward += reward
         
-        # 7. Update Policy
-        if time_step % update_timestep == 0:
-            print(f"Updating Policy... Avg Reward: {running_reward/update_timestep:.2f}")
-            agent.update(memory, hit_history=hit_history_batch)
+        # 7. Save Trajectory Chunk (instead of local Update)
+        # 1024 steps ~ 30 seconds of gameplay
+        if time_step % 1024 == 0:
+            print(f"Saving Trajectory Chunk... Avg Reward: {running_reward/1024:.2f}")
+            
+            # Create Data Payload
+            chunk_data = {
+                'states': memory.states,
+                'actions': memory.actions,
+                'logprobs': memory.logprobs,
+                'rewards': memory.rewards,
+                'is_terminals': memory.is_terminals,
+                'hit_history': hit_history_batch
+            }
+            
+            # Save to Disk
+            # Ensure directory exists
+            train_dir = r"D:\Auto-Farmer-Data\rl_train"
+            if not os.path.exists(train_dir):
+                os.makedirs(train_dir)
+            
+            timestamp = int(time.time())
+            filename = os.path.join(train_dir, f"traj_{timestamp}_{time_step}.pkl")
+            temp_filename = filename + ".tmp"
+            
+            try:
+                with open(temp_filename, 'wb') as f:
+                    pickle.dump(chunk_data, f)
+                os.replace(temp_filename, filename)
+                print(f"Saved chunk to {filename}")
+            except Exception as e:
+                print(f"Failed to save chunk: {e}")
+            
+            # Clear Memory
             memory.clear()
             hit_history_batch = []
-            # Reset hidden state after update? Or keep it?
-            # Usually reset for batch updates if not using TBPTT
-            # agent.reset_hidden() # We now persist hidden state in agent.update logic
+            running_reward = 0
+            
+            # --- Hot Reload Check (Model Update) ---
+            # Check if a new model has been downloaded by sync script
+            # convention: ppo_agent_new.pth
+            new_model_path = "ppo_agent_new.pth"
+            if os.path.exists(new_model_path):
+                print(f"New model found! Reloading weights...")
+                try:
+                    # Wait for file lock/write to finish (simple check)
+                    time.sleep(0.5) 
+                    agent.load(new_model_path)
+                    print("Model reloaded successfully.")
+                    
+                    # Rename/Delete to avoid reloading again
+                    # Backup old
+                    if os.path.exists(model_path):
+                        backup_path = model_path + ".bak"
+                        if os.path.exists(backup_path): os.remove(backup_path)
+                        os.rename(model_path, backup_path)
+                    
+                    # Move new to current
+                    os.replace(new_model_path, model_path)
+                    
+                except Exception as e:
+                    print(f"Model reload failed: {e}")
             running_reward = 0
             
             # Save Model
@@ -273,7 +339,12 @@ def imitation_loop(state_manager, controller):
             try:
                 # Get latest observation
                 obs_data = obs_queue.get(timeout=0.1)
-                pixel_obs, vector_obs = obs_data
+                # Support both legacy (2 items) and new (3 items) formats
+                if len(obs_data) == 3:
+                    pixel_obs, vector_obs, det_dict = obs_data
+                else:
+                    pixel_obs, vector_obs = obs_data
+                    det_dict = {}
             except queue.Empty:
                 continue
                 
@@ -281,8 +352,31 @@ def imitation_loop(state_manager, controller):
             action_idx = listener.get_user_action()
             action_name = get_action_name(action_idx)
             
+            # Get Raw Inputs
+            raw_keys = listener.get_raw_input()
+            # Capture Mouse Delta (Approximate from controller if available, or just 0 for now as listener consumes it)
+            # Better to get it from perception if passed? 
+            # In main loop: mdx, mdy = controller.get_recent_movement() is used for perception.
+            # We don't have controller's recent movement easily here without modifying everything.
+            # But get_user_action just updated last_mouse_pos. 
+            # Let's rely on the action_idx for the main 'action', and raw_keys for details.
+            
             # Calculate Reward (for logging/verification)
             reward = calculate_reward(vector_obs, action_idx, state_manager)
+            
+            # Timestamp (Unix High Precision)
+            timestamp = time.time()
+            
+            # Normalize Det Dict (convert numpy types to python native for safer pickling/json)
+            # We want to store what was detected.
+            # self.last_det is in perception, but we don't have access to perception instance here directly?
+            # We only have state_manager. 
+            # Wait, imitation_loop receives state_manager and controller.
+            # It receives obs_data from queue.
+            # We need to pass detection metadata through the queue if we want it!
+            # Modification: check if obs_queue puts det_dict? 
+            # main.py line 498: obs_queue.put((pixel_obs, vector_obs))
+            # We need to change main.py to put (pixel_obs, vector_obs, det_dict)
             
             # Store Data
             # Compress to uint8/float16 to save space (4x reduction)
@@ -293,12 +387,21 @@ def imitation_loop(state_manager, controller):
                 'flow': pixel_obs['flow'].astype(np.float16) # Flow can be negative, keep float16
             }
             
-            recorded_data.append({
+            entry = {
+                'timestamp': timestamp,
                 'pixel_obs': compressed_obs,
                 'vector_obs': vector_obs.astype(np.float16), # Compress vector too
                 'action': action_idx,
-                'reward': reward
-            })
+                'reward': reward,
+                'raw_input': raw_keys,
+                # 'detections': det_dict # See note above, need to fetch from queue
+            }
+            
+            # If we received det_dict in tuple (which we will add), store it
+            if len(obs_data) >= 3:
+                entry['detections'] = obs_data[2]
+            
+            recorded_data.append(entry)
             
             # Update Status for Visualization
             if status_queue.full():
@@ -495,7 +598,8 @@ def main():
                     obs_queue.get_nowait() # Discard old
                 except queue.Empty:
                     pass
-            obs_queue.put((pixel_obs, vector_obs))
+            # Pass det_dict (perception.last_det) along with obs
+            obs_queue.put((pixel_obs, vector_obs, perception.last_det))
             
             # Check for status updates from Agent
             try:
