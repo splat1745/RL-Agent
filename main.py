@@ -24,7 +24,7 @@ import pickle
 
 
 def preview_detection(perception, capture_service):
-    print("Starting Preview. Press 's' to start Agent, 'd' for Direct Policy, 'i' for Imitation Mode, 'p' to quit.")
+    print("Starting Preview. Press 's' to start Agent, 't' for Temporal Agent, 'd' for Direct Policy, 'i' for Imitation Mode, 'p' to quit.")
     fps_start_time = time.time()
     fps_counter = 0
     fps = 0
@@ -91,6 +91,14 @@ def preview_detection(perception, capture_service):
             except:
                 pass
             return "agent"
+        elif key == ord('t'):
+            print("Starting Temporal Agent (30-frame context)...")
+            cv2.destroyWindow("Preview (Press 's' to Start)")
+            try:
+                cv2.destroyWindow("ROI Logic Preview")
+            except:
+                pass
+            return "temporal"
         elif key == ord('d'):
             print("Starting Direct Policy...")
             cv2.destroyWindow("Preview (Press 's' to Start)")
@@ -147,319 +155,272 @@ def direct_policy_loop(policy, controller, state_manager):
         action_idx = policy.select_action(vector_obs)
         action_name = get_action_name(action_idx)
         
-        # Debug Print
-        print(f"Direct Step {time_step}: Action={action_name}")
-        
-        # Execute Action
-        controller.execute(action_name, duration=0.1) # Faster updates for direct control
-        
-        # Calculate Reward (Just for logging)
-        reward = calculate_reward(vector_obs, action_idx, state_manager)
-        
-        # Update Status
-        if status_queue.full():
-            try:
-                status_queue.get_nowait()
-            except queue.Empty:
-                pass
-        status_queue.put((action_name, reward, None))
-        
+        # Execute
+        controller.execute(action_name, duration=0.1)
         time_step += 1
 
-def agent_loop(agent, memory, controller, state_manager, update_timestep, model_path):
+def agent_loop_muzero(agent, controller, state_manager, perception, cooldown_detector, save_interval, model_path):
     """
-    Runs the RL Agent logic in a separate thread.
+    MuZero online training loop.
+    Handles frame stacking, action selection, transition storage, and periodic training.
+    Uses perception for reward calculation and cooldown_detector for move availability.
     """
-    print("Agent Thread Started.")
-    time_step = 0
-    running_reward = 0
-    hit_history_batch = []
+    from rl.rewards import RewardCalculator
     
-    # No more obs_stack here, handled in inference.py
+    print("MuZero Agent Loop Started.")
+    
+    reward_calc = RewardCalculator()
+    if cooldown_detector:
+        reward_calc.cooldown_detector = cooldown_detector
+    
+    frame_stack = deque(maxlen=4)
+    time_step = 0
+    
+    # Initial Frame Stack - wait for frames
+    print("Filling frame buffer...")
+    while len(frame_stack) < 4:
+        frame = capture_service.get_latest_frame()
+        if frame is None:
+            time.sleep(0.01)
+            continue
+        
+        # Preprocess: resize to 128x128, transpose to (C, H, W)
+        resized = cv2.resize(frame, (128, 128))
+        transposed = np.transpose(resized, (2, 0, 1))  # (3, 128, 128)
+        frame_stack.append(transposed)
+        time.sleep(0.05)
+    
+    print("Buffer filled. Starting interaction...")
     
     while not stop_event.is_set():
         try:
-            # Get latest observation (blocking with timeout)
-            # Queue now returns (pixel_obs, vector_obs, det_dict)
-            obs_data = obs_queue.get(timeout=0.1)
-            if len(obs_data) == 3:
-                pixel_obs, vector_obs, _ = obs_data
+            loop_start = time.time()
+            
+            # 1. State: stack 4 frames -> (12, 128, 128)
+            current_stack = np.concatenate(list(frame_stack), axis=0)  # (12, 128, 128)
+            
+            # 2. Act with epsilon-greedy exploration
+            epsilon = max(0.1, 1.0 - time_step / 10000.0)  # Decay epsilon
+            
+            if np.random.rand() < epsilon:
+                action_idx = np.random.randint(0, agent.action_dim)
             else:
-                pixel_obs, vector_obs = obs_data
-        except queue.Empty:
-            continue
+                action_idx = agent.select_action(current_stack)
             
-        # 3. Agent -> Action
-        # pixel_obs is a dict {'full': ..., 'crop': ..., 'flow': ...}
-        # vector_obs is np.array [36]
-        action_idx, log_prob, intention = agent.select_action(pixel_obs, vector_obs)
-        action_name = get_action_name(action_idx)
-        
-        # Auto-Lock Feature REMOVED
-        # "Remove autolock from everything. direct policy should not be accessable to RL agent."
-        
-        # Debug Print
-        print(f"Agent Step {time_step}: Action={action_name}")
-        
-        # 4. Execute Action (Blocking for duration)
-        controller.execute(action_name, duration=0.3)
-        
-        # 5. Calculate Reward (Use vector_obs for logic)
-        last_hit_len = len(state_manager.hit_history)
-        reward = calculate_reward(vector_obs, action_idx, state_manager)
-        was_hit = len(state_manager.hit_history) > last_hit_len
-        hit_history_batch.append(was_hit)
-        
-        # Update Status for Main Thread
-        if status_queue.full():
-            try:
-                status_queue.get_nowait()
-            except queue.Empty:
-                pass
-        status_queue.put((action_name, reward, intention))
-        
-        # 6. Store in Memory
-        # Compress pixel_obs to uint8 to save Memory and Disk Space
-        compressed_obs = {
-            'full': (pixel_obs['full'] * 255).astype(np.uint8),
-            'crop': (pixel_obs['crop'] * 255).astype(np.uint8),
-            'flow': pixel_obs['flow'].astype(np.float16)
-        }
-        
-        # Store tuple of (compressed_obs, vector_obs)
-        memory.states.append((compressed_obs, vector_obs.astype(np.float16)))
-        memory.actions.append(action_idx)
-        memory.logprobs.append(log_prob)
-        memory.rewards.append(reward)
-        memory.is_terminals.append(False) 
-        
-        time_step += 1
-        running_reward += reward
-        
-        # 7. Save Trajectory Chunk (instead of local Update)
-        # 1024 steps ~ 30 seconds of gameplay
-        if time_step % 1024 == 0:
-            print(f"Saving Trajectory Chunk... Avg Reward: {running_reward/1024:.2f}")
-            
-            # Create Data Payload
-            chunk_data = {
-                'states': memory.states,
-                'actions': memory.actions,
-                'logprobs': memory.logprobs,
-                'rewards': memory.rewards,
-                'is_terminals': memory.is_terminals,
-                'hit_history': hit_history_batch
-            }
-            
-            # Save to Disk
-            # Ensure directory exists
-            train_dir = r"D:\Auto-Farmer-Data\rl_train"
-            if not os.path.exists(train_dir):
-                os.makedirs(train_dir)
-            
-            timestamp = int(time.time())
-            filename = os.path.join(train_dir, f"traj_{timestamp}_{time_step}.pkl")
-            temp_filename = filename + ".tmp"
-            
-            try:
-                with open(temp_filename, 'wb') as f:
-                    pickle.dump(chunk_data, f)
-                os.replace(temp_filename, filename)
-                print(f"Saved chunk to {filename}")
-            except Exception as e:
-                print(f"Failed to save chunk: {e}")
-            
-            # Clear Memory
-            memory.clear()
-            hit_history_batch = []
-            running_reward = 0
-            
-            # --- Hot Reload Check (Model Update) ---
-            # Check if a new model has been downloaded by sync script
-            # convention: ppo_agent_new.pth
-            new_model_path = "ppo_agent_new.pth"
-            if os.path.exists(new_model_path):
-                print(f"New model found! Reloading weights...")
-                try:
-                    # Wait for file lock/write to finish (simple check)
-                    time.sleep(0.5) 
-                    agent.load(new_model_path)
-                    print("Model reloaded successfully.")
-                    
-                    # Rename/Delete to avoid reloading again
-                    # Backup old
-                    if os.path.exists(model_path):
-                        backup_path = model_path + ".bak"
-                        if os.path.exists(backup_path): os.remove(backup_path)
-                        os.rename(model_path, backup_path)
-                    
-                    # Move new to current
-                    os.replace(new_model_path, model_path)
-                    
-                except Exception as e:
-                    print(f"Model reload failed: {e}")
-            running_reward = 0
-            
-            # Save Model
-            print(f"Saving model to {model_path}...")
-            agent.save(model_path)
-
-def imitation_loop(state_manager, controller):
-    """
-    Records user inputs and observations for imitation learning.
-    """
-    print("Imitation Mode Started. Recording...")
-    listener = InputListener()
-    
-    # Data Storage
-    recorded_data = []
-    save_interval = 1000
-    step_count = 0
-    
-    data_dir = r"D:\Auto-Farmer-Data\imitation_train"
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir)
-
-    # Find next available index
-    existing_files = [f for f in os.listdir(data_dir) if f.startswith("data_") and f.endswith(".pkl")]
-    max_idx = 0
-    for f in existing_files:
-        try:
-            idx = int(f.split("_")[1].split(".")[0])
-            if idx > max_idx:
-                max_idx = idx
-        except:
-            pass
-    
-    current_file_idx = max_idx + 1
-    print(f"Starting recording at index {current_file_idx}...")
-        
-    try:
-        while not stop_event.is_set():
-            try:
-                # Get latest observation
-                obs_data = obs_queue.get(timeout=0.1)
-                # Support both legacy (2 items) and new (3 items) formats
-                if len(obs_data) == 3:
-                    pixel_obs, vector_obs, det_dict = obs_data
-                else:
-                    pixel_obs, vector_obs = obs_data
-                    det_dict = {}
-            except queue.Empty:
-                continue
-                
-            # Get User Action
-            action_idx = listener.get_user_action()
             action_name = get_action_name(action_idx)
             
-            # Get Raw Inputs
-            raw_keys = listener.get_raw_input()
-            # Capture Mouse Delta (Approximate from controller if available, or just 0 for now as listener consumes it)
-            # Better to get it from perception if passed? 
-            # In main loop: mdx, mdy = controller.get_recent_movement() is used for perception.
-            # We don't have controller's recent movement easily here without modifying everything.
-            # But get_user_action just updated last_mouse_pos. 
-            # Let's rely on the action_idx for the main 'action', and raw_keys for details.
+            # 3. Execute action
+            controller.execute(action_name, duration=0.1)
             
-            # Calculate Reward (for logging/verification)
-            reward = calculate_reward(vector_obs, action_idx, state_manager)
+            # 4. Observe next state
+            time.sleep(0.05)  # Wait for effect
+            frame = capture_service.get_latest_frame()
+            if frame is None:
+                continue
             
-            # Timestamp (Unix High Precision)
-            timestamp = time.time()
+            # Run perception for reward calculation
+            try:
+                perception.detect(frame)  # Updates internal state (HP, detections)
+            except:
+                pass
             
-            # Normalize Det Dict (convert numpy types to python native for safer pickling/json)
-            # We want to store what was detected.
-            # self.last_det is in perception, but we don't have access to perception instance here directly?
-            # We only have state_manager. 
-            # Wait, imitation_loop receives state_manager and controller.
-            # It receives obs_data from queue.
-            # We need to pass detection metadata through the queue if we want it!
-            # Modification: check if obs_queue puts det_dict? 
-            # main.py line 498: obs_queue.put((pixel_obs, vector_obs))
-            # We need to change main.py to put (pixel_obs, vector_obs, det_dict)
+            # Update cooldown status
+            if cooldown_detector:
+                cooldown_detector.update(frame)
             
-            # Store Data
-            # Compress to uint8/float16 to save space (4x reduction)
-            # pixel_obs is 0.0-1.0 float32. We convert to 0-255 uint8.
-            compressed_obs = {
-                'full': (pixel_obs['full'] * 255).astype(np.uint8),
-                'crop': (pixel_obs['crop'] * 255).astype(np.uint8),
-                'flow': pixel_obs['flow'].astype(np.float16) # Flow can be negative, keep float16
-            }
+            # Calculate reward using perception-based heuristics
+            reward = reward_calc.calculate(perception, action_idx)
             
-            entry = {
-                'timestamp': timestamp,
-                'pixel_obs': compressed_obs,
-                'vector_obs': vector_obs.astype(np.float16), # Compress vector too
-                'action': action_idx,
-                'reward': reward,
-                'raw_input': raw_keys,
-                # 'detections': det_dict # See note above, need to fetch from queue
-            }
+            # Preprocess next frame
+            resized = cv2.resize(frame, (128, 128))
+            next_frame_transposed = np.transpose(resized, (2, 0, 1))
             
-            # If we received det_dict in tuple (which we will add), store it
-            if len(obs_data) >= 3:
-                entry['detections'] = obs_data[2]
+            # Build next stack
+            next_stack_list = list(frame_stack)[1:] + [next_frame_transposed]
+            next_stack = np.concatenate(next_stack_list, axis=0)
             
-            recorded_data.append(entry)
+            done = False
             
-            # Update Status for Visualization
-            if status_queue.full():
+            # 5. Store transition
+            agent.store_transition(current_stack, action_idx, reward, next_stack, done, 0.0)
+            
+            # 6. Train periodically
+            if time_step > 100 and time_step % 64 == 0:
                 try:
-                    status_queue.get_nowait()
-                except queue.Empty:
-                    pass
-            status_queue.put((f"REC: {action_name}", reward, None))
+                    loss, pl, vl, dl = agent.update_with_buffer(batch_size=8)
+                    if status_queue.full():
+                        status_queue.get_nowait()
+                    status_queue.put((f"Train L={loss:.2f}", reward, None))
+                except Exception as e:
+                    print(f"Training error: {e}")
+            elif time_step % 10 == 0:
+                if status_queue.full():
+                    try:
+                        status_queue.get_nowait()
+                    except:
+                        pass
+                status_queue.put((f"Act {action_name}", reward, None))
             
-            step_count += 1
+            # Update frame stack
+            frame_stack.append(next_frame_transposed)
+            time_step += 1
             
             # Save periodically
-            if step_count % save_interval == 0:
-                filename = f"{data_dir}/data_{current_file_idx}.pkl"
-                temp_filename = filename + ".tmp"
-                print(f"Saving {len(recorded_data)} steps to {filename}...")
+            if time_step % save_interval == 0:
+                agent.save(model_path)
+                print(f"Online Model Saved at step {time_step}.")
                 
-                # Write to temp file first (Atomic Write)
-                with open(temp_filename, 'wb') as f:
-                    pickle.dump(recorded_data, f)
-                
-                # Rename to final .pkl (Sync loop will only see it now)
-                os.replace(temp_filename, filename)
-                
-                recorded_data = [] # Clear buffer
-                current_file_idx += 1
+        except Exception as e:
+            print(f"Error in Agent Loop: {e}")
+            time.sleep(0.5)
+    
+    print("MuZero Agent Loop Ended.")
 
-    except Exception as e:
-        print(f"Error in imitation loop: {e}")
-    finally:
-        # Save remaining data
-        if recorded_data:
-            filename = f"{data_dir}/data_{current_file_idx}.pkl"
-            temp_filename = filename + ".tmp"
-            print(f"Saving final {len(recorded_data)} steps to {filename}...")
+def temporal_agent_loop(agent, controller, perception, cooldown_detector, save_interval, model_path, training_stage=2):
+    """
+    Temporal agent loop with 30-frame context and safety override.
+    Uses multihead predictions for policy, HP danger, and action sequences.
+    """
+    print(f"Temporal Agent Loop Started. Training Stage: {training_stage}")
+    
+    # Import reward calculator
+    from rl.rewards import RewardCalculator
+    reward_calc = RewardCalculator()
+    
+    agent.set_stage(training_stage)
+    agent.reset_episode()
+    
+    time_step = 0
+    last_hp = 1.0
+    train_interval = 64
+    
+    # Fill initial buffers
+    print("Filling 30-frame buffer...")
+    while not agent.is_ready():
+        frame = capture_service.get_latest_frame()
+        if frame is None:
+            time.sleep(0.01)
+            continue
+        agent.observe(frame, reward=0.0, hp_delta=0.0)
+        time.sleep(0.03)  # ~30fps
+    
+    print("Buffer filled. Starting interaction...")
+    
+    while not stop_event.is_set():
+        try:
+            # 1. Get current frame
+            frame = capture_service.get_latest_frame()
+            if frame is None:
+                time.sleep(0.01)
+                continue
             
-            with open(temp_filename, 'wb') as f:
-                pickle.dump(recorded_data, f)
-            os.replace(temp_filename, filename)
+            # 2. Run perception
+            try:
+                perception.detect(frame)
+            except:
+                pass
             
-        print("Imitation Loop Ended.")
+            # 3. Get cooldown state
+            cooldowns = np.array([0.0, 0.0, 0.0, 0.0])
+            if cooldown_detector:
+                cooldown_detector.update(frame)
+                cooldowns = np.array([
+                    1.0 if not cooldown_detector.is_move_available(i) else 0.0 
+                    for i in range(4)
+                ])
+            
+            # 4. Calculate epsilon based on training progress
+            epsilon = max(0.05, 0.5 - agent.train_steps / 50000.0)
+            
+            # 5. Select action (with safety override)
+            action_idx, action_info = agent.select_action(cooldowns, epsilon=epsilon)
+            action_name = get_action_name(action_idx)
+            
+            # 6. Execute action
+            controller.execute(action_name, duration=0.1)
+            
+            # 7. Wait and observe next frame
+            time.sleep(0.03)
+            next_frame = capture_service.get_latest_frame()
+            if next_frame is None:
+                continue
+            
+            # 8. Calculate reward
+            try:
+                perception.detect(next_frame)
+            except:
+                pass
+            
+            current_hp = getattr(perception, 'filtered_health', 1.0)
+            hp_delta = current_hp - last_hp
+            reward = reward_calc.calculate(perception, action_idx)
+            last_hp = current_hp
+            
+            # 9. Observe for agent buffer
+            agent.observe(next_frame, reward=reward, hp_delta=hp_delta)
+            
+            # 10. Store sequence periodically
+            if time_step % 30 == 0:
+                agent.store_sequence(cooldowns, done=False)
+            
+            # 11. Train
+            if time_step > 100 and time_step % train_interval == 0:
+                losses = agent.train_step(batch_size=8)
+                if losses:
+                    loss_str = " ".join([f"{k}:{v:.3f}" for k, v in losses.items()])
+                    if status_queue.full():
+                        try:
+                            status_queue.get_nowait()
+                        except:
+                            pass
+                    danger = action_info.get('danger', 0)
+                    status_queue.put((f"Train {loss_str}", reward, danger))
+            elif time_step % 10 == 0:
+                if status_queue.full():
+                    try:
+                        status_queue.get_nowait()
+                    except:
+                        pass
+                danger = action_info.get('danger', 0)
+                status_queue.put((f"Act {action_name} D={danger:.2f}", reward, danger))
+            
+            time_step += 1
+            
+            # 12. Save periodically
+            if time_step % save_interval == 0:
+                agent.save(model_path)
+                print(f"Temporal Model Saved at step {time_step}.")
+                
+        except Exception as e:
+            print(f"Error in Temporal Loop: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(0.5)
+    
+    print("Temporal Agent Loop Ended.")
 
 def main():
     print("--- Auto-Farmer RL Agent ---")
     
     # Parse args with argparse
     parser = argparse.ArgumentParser(description="Auto-Farmer RL Agent")
-    parser.add_argument("--setup", "-s", action="store_true", help="Force run the setup wizard")
+    parser.add_argument("--setup", "-s", action="store_true", help="Force run the health bar setup wizard")
+    parser.add_argument("--setup-cooldown", action="store_true", help="Run the cooldown bar setup wizard")
     parser.add_argument("--model", "-m", type=str, default=None, 
                         help="Path to detection model (.pt for YOLO, .pth for RF-DETR)")
     parser.add_argument("--agent-model", type=str, default=None, help="Path to pretrained RL agent model")
     parser.add_argument("--fast", action="store_true", help="Enable FP8 precision (Fast Mode)")
+    parser.add_argument("--temporal", action="store_true", help="Use temporal agent (30-frame context)")
+    parser.add_argument("--stage", type=int, default=2, choices=[2, 3], help="Training stage (2=warmup, 3=hybrid)")
     args = parser.parse_args()
     
     force_setup = args.setup
+    force_cooldown_setup = args.setup_cooldown
     detection_model_path = args.model
     agent_model_path = args.agent_model
     fast_mode = args.fast
+    use_temporal = args.temporal
+    training_stage = args.stage
     
     if detection_model_path:
         print(f"Using detection model: {detection_model_path}")
@@ -477,8 +438,22 @@ def main():
     # Check Config
     wizard = ConfigWizard(capture_service)
     if force_setup or not wizard.validate_config():
-        print("Starting setup wizard...")
+        print("Starting health bar setup wizard...")
         wizard.select_health_bar()
+    
+    # Cooldown Setup Wizard
+    if force_cooldown_setup:
+        print("Starting cooldown bar setup wizard...")
+        wizard.select_cooldown_bars()
+    
+    # Load Cooldown Detector
+    from utils.config_wizard import CooldownDetector
+    cooldown_rois = ConfigWizard.load_cooldown_rois()
+    cooldown_detector = CooldownDetector(cooldown_rois) if cooldown_rois else None
+    if cooldown_detector:
+        print(f"Loaded {len(cooldown_rois)} cooldown ROIs.")
+    else:
+        print("No cooldown ROIs configured. Use --setup-cooldown to configure.")
     
     # 2. Initialize Components
     print("Initializing Perception...")
@@ -490,38 +465,25 @@ def main():
     # 15: r_2
     # 16: g
     # 17: space (Jump)
-    # 18: f (Block)
-    # 19: m1 (Single Click)
-    # 20: turn_left_micro
-    # 21: turn_right_micro
-    # 22: turn_left_small
-    # 23: turn_right_small
-    # 24: turn_left_large
-    # 25: turn_right_large
-    agent = PPOAgent(action_dim=26)
     
-    # Load existing model
-    # Priority: CLI Argument > Default File
-    model_path = "ppo_agent_pixel.pth" 
+    # Instantiate MuZero Agent
+    from rl.muzero_agent import MuZeroAgent
+    agent = MuZeroAgent()
     
-    if agent_model_path and os.path.exists(agent_model_path):
-        print(f"Loading pretrained agent from {agent_model_path}...")
-        try:
-            agent.load(agent_model_path)
-            model_path = agent_model_path # Save back to this file if we continue training? Or keep separate?
-            # Let's keep saving to the default or a new file to avoid overwriting the base
-        except Exception as e:
-            print(f"Error loading agent model: {e}")
-    elif os.path.exists(model_path):
+    # Load Offline Weights if available
+    model_path = agent_model_path if agent_model_path else "muzero_agent_offline.pth"
+    
+    if os.path.exists(model_path):
         print(f"Loading existing model from {model_path}...")
         try:
-            # agent.load(model_path)
-            print("Skipping load to reset behavior loop.")
+            agent.load(model_path)
+            print("Model loaded successfully.")
         except Exception as e:
-            print(f"Error loading model: {e}. Starting from scratch.")
+            print(f"Error loading agent model: {e}")
+            print("Starting from scratch.")
+    else:
+        print("No offline model found. Starting from scratch.")
             
-    memory = Memory()
-    
     print("Initializing Controls...")
     controller = InputController()
     state_manager = StateManager()
@@ -540,14 +502,62 @@ def main():
     mode = preview_detection(perception, capture_service)
     
     if mode == "agent":
-        # 5. Start Agent Thread
-        agent_thread = threading.Thread(target=agent_loop, args=(agent, memory, controller, state_manager, 10, model_path))
+        # 5. Start Agent Thread with perception and cooldown detector for rewards
+        agent_thread = threading.Thread(target=agent_loop_muzero, 
+                                      args=(agent, controller, state_manager, perception, cooldown_detector, 1000, "muzero_agent_online.pth"))
         agent_thread.daemon = True
         agent_thread.start()
         
-        # Hot Reload Loop (in Main Thread)
-        # We check for model updates while the visualization runs
+        # UI Loop
+        while True:
+            try:
+                msg = status_queue.get(timeout=0.1)
+                print(f"STATUS: {msg[0]} R={msg[1]}")
+            except:
+                pass
+            # Check if thread died
+            if not agent_thread.is_alive():
+                print("Agent thread died.")
+                break
+            time.sleep(0.1)
+    
+    elif mode == "temporal":
+        # Initialize Temporal Agent
+        from rl.temporal_agent import TemporalAgent
         
+        temporal_agent = TemporalAgent(
+            action_dim=26,
+            hidden_dim=384,
+            seq_len=30,
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            stage=training_stage
+        )
+        
+        # Load existing model if available
+        if os.path.exists("temporal_agent.pth"):
+            temporal_agent.load("temporal_agent.pth")
+        
+        # Start Temporal Agent Thread
+        agent_thread = threading.Thread(
+            target=temporal_agent_loop,
+            args=(temporal_agent, controller, perception, cooldown_detector, 1000, "temporal_agent.pth", training_stage)
+        )
+        agent_thread.daemon = True
+        agent_thread.start()
+        
+        # UI Loop with danger indicator
+        while True:
+            try:
+                msg = status_queue.get(timeout=0.1)
+                danger = msg[2] if len(msg) > 2 else 0
+                print(f"STATUS: {msg[0]} R={msg[1]:.3f} DANGER={danger:.2f}")
+            except:
+                pass
+            if not agent_thread.is_alive():
+                print("Temporal agent thread died.")
+                break
+            time.sleep(0.1)
+            
     elif mode == "direct":
         # 5. Start Direct Policy Thread
         policy = DirectPolicy()

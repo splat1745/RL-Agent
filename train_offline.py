@@ -17,10 +17,21 @@ def load_trajectory(filepath):
             data = pickle.load(f)
             
         memory = []
-        states = data['states'] # List of (compressed_obs, vector_obs)
-        actions = data['actions']
-        rewards = data['rewards']
-        logprobs = data['logprobs']
+        if isinstance(data, dict):
+            # Columnar format (RL Train)
+            states = data['states'] 
+            actions = data['actions']
+            rewards = data['rewards']
+            logprobs = data.get('logprobs', [0.0]*len(actions))
+        elif isinstance(data, list):
+            # Row-based format (Imitation Train)
+            # Keys confirmed: 'pixel_obs', 'vector_obs', 'action', 'reward'
+            states = [d['pixel_obs'] for d in data]
+            actions = [d['action'] for d in data]
+            rewards = [d['reward'] for d in data]
+            logprobs = [d.get('logprob', 0.0) for d in data]
+        else:
+            raise ValueError(f"Unknown data type: {type(data)}")
         
         # Pre-process frames: uint8 -> float32 0-1, Resize to 128x128
         # Stack: full frame only? Or full + flow?
@@ -29,7 +40,14 @@ def load_trajectory(filepath):
         
         processed_frames = []
         
-        for i, (comp_obs, _) in enumerate(states):
+        for i, item in enumerate(states):
+            # Handle different state formats
+            if isinstance(item, tuple) or isinstance(item, list):
+                comp_obs = item[0]
+                # vector_obs = item[1] (unused in vision-only)
+            else:
+                comp_obs = item
+            
             # Decompress
             # comp_obs['full'] is (160, 160, 3)? No, check main.py compression
             # main.py: (pixel_obs['full'] * 255).astype(np.uint8)
@@ -80,6 +98,11 @@ def load_trajectory(filepath):
                 elif resized.shape[0] == 12:
                     # Perfect
                     pass
+                elif resized.shape[0] == 16:
+                    # 4 frames * 4 channels (RGBD) -> Keep RGB (12)
+                    # Assumes [R1,G1,B1,D1, R2,G2,B2,D2, ...]
+                    indices = [0,1,2, 4,5,6, 8,9,10, 12,13,14]
+                    resized = resized[indices, :, :]
                 else:
                     print(f"Skipping bad channel count after resize: {resized.shape}", flush=True)
                     continue
@@ -109,14 +132,19 @@ def load_trajectory(filepath):
         return []
 
 def train_offline():
-    data_dir = "D:\\Auto-Farmer-Data\\rl_train" # New RL data
-    # fallback to imitation data if rl_train is empty
+    # Priority: Imitation Data (Expert) > RL Data (Experience)
+    data_dir = "D:\\Auto-Farmer-Data\\imitation_train"
+    
     if not os.path.exists(data_dir) or not glob.glob(os.path.join(data_dir, "*.pkl")):
-        data_dir = "D:\\Auto-Farmer-Data\\imitation_train"
-        print(f"Using imitation data from {data_dir}")
+        print(f"No imitation data found in {data_dir}. Checking rl_train...")
+        data_dir = "D:\\Auto-Farmer-Data\\rl_train"
         
     files = glob.glob(os.path.join(data_dir, "*.pkl"))
     files.sort()
+    
+    if not files:
+        print("No training data found!")
+        return
     
     agent = MuZeroAgent()
     
@@ -138,11 +166,8 @@ def train_offline():
             if not memory: continue
             
             # Train on this trajectory
-            # We can split it into mini-batches if too large for GPU VRAM
-            # Trajectory is 1024 steps. 
-            # 1024 * 12 * 128 * 128 * 4 bytes ~ 800MB. Should fit on 3050/5070 easily.
-            
-            l, pl, vl, dl = agent.update(memory)
+            # Use update_trajectory for truncated BPTT (fixes OOM)
+            l, pl, vl, dl = agent.update_trajectory(memory, chunk_size=32)
             
             total_loss += l
             p_loss_total += pl
@@ -151,7 +176,11 @@ def train_offline():
             
             pbar.set_description(f"Loss: {l:.4f} (P={pl:.2f} V={vl:.2f} D={dl:.2f})")
             
-        avg_loss = total_loss / len(files)
+            # Help GC
+            del memory
+            torch.cuda.empty_cache()
+            
+        avg_loss = total_loss / (len(files) + 1e-7)
         print(f"Epoch {epoch} Avg Loss: {avg_loss:.4f}")
         
         agent.save("muzero_agent_offline.pth")
