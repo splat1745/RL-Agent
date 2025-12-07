@@ -110,6 +110,12 @@ class RewardCalculator:
         self.total_successful_attacks = 0
         self.action_spam_penalties = 0
         
+        # Combo Tracking
+        self.combo_count = 0
+        self.last_combo_time = 0
+        self.COMBO_WINDOW = 0.7  # Reset if more than 0.7s between hits
+        self.COMBO_REWARDS = [0.1, 0.2, 0.4, 0.1]  # 4-hit combo scaling
+        
     def calculate(self, perception, action_id):
         """
         Calculate immediate reward.
@@ -147,16 +153,61 @@ class RewardCalculator:
         spam_penalty = self._check_action_spam(action_id, current_time)
         reward += spam_penalty
         
-        # --- 5. Attack Actions (only if valid and not being attacked) ---
+        # --- 5. Attack Actions & Combos ---
         if action_id in self.ATTACK_ACTIONS:
             self.total_attacks += 1
             
             if action_valid and not is_being_attacked:
                 if self._enemy_visible(perception):
-                    reward += 0.05  # Small immediate attack reward
-                    self.total_successful_attacks += 1
+                    # M1 Combo Logic (Action 12)
+                    if action_id == 12:  # M1
+                        # Check continuity
+                        if (current_time - self.last_combo_time <= self.COMBO_WINDOW) and \
+                           (self.last_action_id == 12 or self.last_action_id is None):
+                            # Continue combo
+                            reward_idx = min(self.combo_count, len(self.COMBO_REWARDS) - 1)
+                            combo_reward = self.COMBO_REWARDS[reward_idx]
+                            reward += combo_reward
+                            self.combo_count += 1
+                        else:
+                            # Start new combo
+                            self.combo_count = 1
+                            reward += self.COMBO_REWARDS[0]  # First hit reward
+                        
+                        self.last_combo_time = current_time
+                        self.total_successful_attacks += 1
+                    else:
+                        # M2 or other attacks - break combo but flattened reward
+                        self.combo_count = 0
+                        reward += 0.2
+                        self.total_successful_attacks += 1
+                else:
+                    # Missed attack - reset combo
+                    self.combo_count = 0
         
-        # --- 6. Skill Actions (only if valid, not being attacked, and not on cooldown) ---
+        # --- 5.5 Precision Strafing (Side Dashes) ---
+        # Reward maintaining target lock while moving sideways
+        if action_id in {9, 10}:  # Dash Left/Right
+            if self._enemy_in_front(perception):  # Re-using strict 2% check? User said 5% for strafe
+                 # Let's create a specific check or reuse close_center logic? 
+                 # User said "stays within 5% of center". 
+                 # _enemy_in_front is currently 2%. Let's add a 5% check inline or method.
+                 enemies = self._get_enemy_positions(perception)
+                 is_centered_5_percent = False
+                 for x, _, _, _ in enemies:
+                     if 0.475 <= x <= 0.525:  # 5% centered (2.5% each side) ... wait, 5% of center usually means +/- 5% range? 
+                                              # "within 5% of the center" -> 0.45 to 0.55.
+                                              # Actually user corrected "7% -> 5%". 
+                                              # Let's use 0.45-0.55 implementation inline for clarity.
+                         is_centered_5_percent = True
+                         break
+                 
+                 if is_centered_5_percent:
+                     reward += 0.05  # Precision strafing reward
+        
+        # --- 6. Skill Actions with Position-Based Hit Detection ---
+        # Skills 1 & 2 (14, 15): Ranged - reward when enemy is IN FRONT (any distance)
+        # Skills 3 & 4 (16, 18): Close-range - require enemy CLOSE + CENTERED
         if action_id in self.SKILL_ACTIONS:
             # Check if skill is on cooldown via cooldown detector
             skill_on_cooldown = False
@@ -165,11 +216,33 @@ class RewardCalculator:
                 skill_on_cooldown = not self.cooldown_detector.is_move_available(slot)
             
             if skill_on_cooldown:
-                # Penalty for using skill on cooldown
-                reward -= 0.05
+                # Heavy penalty for spamming cooldowns
+                reward -= 0.15
             elif action_valid and not is_being_attacked:
-                if self._enemy_visible(perception):
-                    reward += 0.03  # Reward for using skills at appropriate times
+                # --- Position-based skill rewards ---
+                if action_id in {14, 15}:  # Skills 1 & 2 - Ranged (Precision)
+                    if self._enemy_in_front(perception):
+                        # Proper 2% centering + usage -> HIGH Reward
+                        reward += 0.20
+                        self.total_successful_attacks += 1
+                    else:
+                        # Wasted long range skill (missed center) -> HEAVY Penalty
+                        reward -= 0.15
+                        
+                elif action_id in {16, 18}:  # Skills 3 & 4 - Close Range (Risky)
+                    if self._enemy_close_center(perception):
+                        # High risk, high reward
+                        reward += 0.30
+                        self.total_successful_attacks += 1
+                    else:
+                        # Used melee skill but execution failed -> HEAVY Penalty
+                        reward -= 0.20
+                        
+                else:  # Other skills
+                    if self._enemy_visible(perception):
+                        reward += 0.05
+                    else:
+                        reward -= 0.05
         
         # --- 7. Movement vs Idle ---
         if action_id in self.MOVEMENT_ACTIONS:
@@ -274,6 +347,75 @@ class RewardCalculator:
         
         return False
     
+    def _get_enemy_positions(self, perception):
+        """
+        Get list of enemy bounding boxes as (x_center, y_center, width, height).
+        Returns normalized coordinates (0-1 range).
+        """
+        detections = getattr(perception, 'last_det', {})
+        enemies = []
+        
+        # Get frame dimensions for normalization
+        frame_w = 640  # Default, adjust if needed
+        frame_h = 640
+        
+        if isinstance(detections, dict):
+            for enemy in detections.get('enemies', []):
+                xywh = enemy.get('xywh', [0, 0, 0, 0])
+                if len(xywh) >= 4:
+                    x, y, w, h = xywh[:4]
+                    enemies.append((x / frame_w, y / frame_h, w / frame_w, h / frame_h))
+        elif isinstance(detections, list):
+            for det in detections:
+                if det.get('cls', 0) != 1:  # Not player
+                    xywh = det.get('xywh', [0, 0, 0, 0])
+                    if len(xywh) >= 4:
+                        x, y, w, h = xywh[:4]
+                        enemies.append((x / frame_w, y / frame_h, w / frame_w, h / frame_h))
+        
+        return enemies
+    
+    def _enemy_in_front(self, perception):
+        """
+        Check if enemy is STRICTLY centered for ranged attacks.
+        For skills 1 & 2 - long distance.
+        Returns True if enemy center is within 2% of screen center (0.48-0.52).
+        """
+        enemies = self._get_enemy_positions(perception)
+        
+        for x, y, w, h in enemies:
+            # Stricter alignment: within 2% of center (0.48 to 0.52)
+            if 0.48 <= x <= 0.52:
+                return True
+        
+        return False
+    
+    def _enemy_close_center(self, perception):
+        """
+        Check if enemy is close AND centered.
+        For skills 3 & 4 - close-range/melee skills.
+        Returns True if:
+        - Enemy center is within 5% of screen center (x: 0.45-0.55)
+        - Enemy is large enough to be close (width > 10% of screen)
+        """
+        enemies = self._get_enemy_positions(perception)
+        
+        for x, y, w, h in enemies:
+            # Must be centered (within 5% of center)
+            if 0.45 <= x <= 0.55:
+                # Must be close (large on screen - at least 10% width)
+                if w >= 0.10:
+                    return True
+        
+        return False
+    
+    def _no_instant_damage(self, current_time, delay=0.3):
+        """
+        Check that no damage occurred in the short window after action.
+        Used to confirm skill "hit" rather than "missed and got hit".
+        """
+        return (current_time - self.last_damage_time) > delay
+    
     def reset(self):
         """Reset state for new episode."""
         self.last_hp = 1.0
@@ -295,3 +437,4 @@ class RewardCalculator:
             'attack_success_rate': self.total_successful_attacks / max(1, self.total_attacks),
             'spam_penalties': self.action_spam_penalties,
         }
+

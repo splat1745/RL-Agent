@@ -390,6 +390,13 @@ def temporal_agent_loop(agent, controller, perception, cooldown_detector, save_i
             if time_step % save_interval == 0:
                 agent.save(model_path)
                 print(f"Temporal Model Saved at step {time_step}.")
+            
+            # Auto-shutdown for Stage 2
+            if training_stage == 2 and agent.train_steps >= 102000:
+                print("Stage 2 Training Complete (102k steps). Saving and stopping...")
+                agent.save(model_path)
+                stop_event.set()
+                break
                 
         except Exception as e:
             print(f"Error in Temporal Loop: {e}")
@@ -411,7 +418,7 @@ def main():
     parser.add_argument("--agent-model", type=str, default=None, help="Path to pretrained RL agent model")
     parser.add_argument("--fast", action="store_true", help="Enable FP8 precision (Fast Mode)")
     parser.add_argument("--temporal", action="store_true", help="Use temporal agent (30-frame context)")
-    parser.add_argument("--stage", type=int, default=2, choices=[2, 3], help="Training stage (2=warmup, 3=hybrid)")
+    parser.add_argument("--stage", type=int, default=2, choices=[2, 3, 4], help="Training stage (2=warmup, 3=hybrid, 4=safety_override)")
     args = parser.parse_args()
     
     force_setup = args.setup

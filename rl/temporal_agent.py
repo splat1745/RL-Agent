@@ -29,7 +29,7 @@ class TemporalReplayBuffer:
         self.capacity = capacity
         self.buffer = deque(maxlen=capacity)
         
-    def push(self, frames, actions, cooldowns, rewards, hp_deltas, done):
+    def push(self, frames, actions, cooldowns, rewards, hp_deltas, enemy_states, done):
         """
         Store a transition sequence.
         
@@ -39,6 +39,7 @@ class TemporalReplayBuffer:
             cooldowns: [4] - cooldown state at end
             rewards: [T] - rewards per step
             hp_deltas: [T] - HP changes per step (negative = damage)
+            enemy_states: [T, 6] - enemy numerical states
             done: bool
         """
         self.buffer.append({
@@ -47,6 +48,7 @@ class TemporalReplayBuffer:
             'cooldowns': cooldowns,
             'rewards': rewards,
             'hp_deltas': hp_deltas,
+            'enemy_states': enemy_states,
             'done': done
         })
         
@@ -61,7 +63,8 @@ class TemporalReplayBuffer:
             'cooldowns': torch.FloatTensor(np.stack([b['cooldowns'] for b in batch])),
             'rewards': torch.FloatTensor(np.stack([b['rewards'] for b in batch])),
             'hp_deltas': torch.FloatTensor(np.stack([b['hp_deltas'] for b in batch])),
-            'done': torch.BoolTensor([b['done'] for b in batch])
+            'enemy_states': torch.FloatTensor(np.stack([b['enemy_states'] for b in batch])),
+            'dones': torch.FloatTensor(np.array([b['done'] for b in batch]))
         }
     
     def __len__(self):
@@ -127,6 +130,11 @@ class TemporalAgent:
         self.action_buffer = deque(maxlen=seq_len)
         self.reward_buffer = deque(maxlen=seq_len)
         self.hp_delta_buffer = deque(maxlen=seq_len)
+        self.enemy_state_buffer = deque(maxlen=seq_len)  # [6] state x,y,w,h,vx,vy
+        
+        # State tracking for velocity calculation
+        self.prev_enemy_pos = None  # (x, y, time) for velocity
+        self.prev_time = 0
         
         # Hidden states for recurrent processing
         self.hidden_states = None
@@ -156,6 +164,7 @@ class TemporalAgent:
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
         return lr
+
     def preprocess_frame(self, frame):
         """
         Preprocess frame for network.
@@ -168,14 +177,76 @@ class TemporalAgent:
         normalized = rgb.astype(np.float32) / 255.0
         transposed = np.transpose(normalized, (2, 0, 1))  # [3, 128, 128]
         return transposed
+
+    def _get_enemy_state(self, perception):
+        """
+        Extract enemy state vector: [x, y, w, h, vx, vy]
+        Normalized coordinates 0-1. Velocity in units per second.
+        """
+        current_time = time.time()
+        
+        # Default state (no enemy)
+        state = np.zeros(6, dtype=np.float32)
+        
+        # Get detections
+        detections = getattr(perception, 'last_det', {})
+        target = None
+        
+        # Find primary target
+        if isinstance(detections, dict):
+            enemies = detections.get('enemies', [])
+            if enemies:
+                # Pick largest enemy (closest)
+                # xywh is [x, y, w, h] pixel coords
+                target = max(enemies, key=lambda e: e.get('xywh', [0,0,0,0])[2] * e.get('xywh', [0,0,0,0])[3])
+        elif isinstance(detections, list):
+            for det in detections:
+                 if det.get('cls', 0) != 1: # Not player
+                     # Simple heuristic: take first enemy
+                     target = det
+                     break
+            
+        if target:
+            # Normalize coords
+            frame_w, frame_h = 640, 640 # Default dims
+            xywh = target.get('xywh', [0, 0, 0, 0])
+            if len(xywh) >= 4:
+                x, y, w, h = xywh[:4]
+                
+                nx = x / frame_w
+                ny = y / frame_h
+                nw = w / frame_w
+                nh = h / frame_h
+                
+                # Calculate velocity if previous state exists
+                vx, vy = 0.0, 0.0
+                if self.prev_enemy_pos is not None:
+                    px, py, pt = self.prev_enemy_pos
+                    dt = current_time - pt
+                    if 0 < dt < 1.0:  # Reasonable window
+                        vx = (nx - px) / dt
+                        vy = (ny - py) / dt
+                
+                # Update tracking
+                self.prev_enemy_pos = (nx, ny, current_time)
+                
+                state = np.array([nx, ny, nw, nh, vx, vy], dtype=np.float32)
+        else:
+            # No enemy - reset tracking
+            self.prev_enemy_pos = None
+            
+        return state
     
-    def observe(self, frame, reward=0.0, hp_delta=0.0):
+    def observe(self, frame, perception=None, reward=0.0, hp_delta=0.0):
         """
         Add observation to buffers.
         Called each step during online play.
         """
         processed = self.preprocess_frame(frame)
+        enemy_state = self._get_enemy_state(perception)
+        
         self.frame_buffer.append(processed)
+        self.enemy_state_buffer.append(enemy_state)
         self.reward_buffer.append(reward)
         self.hp_delta_buffer.append(hp_delta)
         
@@ -202,19 +273,21 @@ class TemporalAgent:
         frames = torch.FloatTensor(np.stack(list(self.frame_buffer))).unsqueeze(0).to(self.device)  # [1, T, 3, H, W]
         actions = torch.LongTensor(list(self.action_buffer)).unsqueeze(0).to(self.device)  # [1, T]
         cooldowns_t = torch.FloatTensor(cooldowns).unsqueeze(0).to(self.device)  # [1, 4]
+        enemy_states = torch.FloatTensor(np.stack(list(self.enemy_state_buffer))).unsqueeze(0).to(self.device) # [1, T, 6]
         
         # Pad actions if needed
         if actions.shape[1] < self.seq_len:
             pad = torch.zeros(1, self.seq_len - actions.shape[1], dtype=torch.long, device=self.device)
             actions = torch.cat([pad, actions], dim=1)
         
-        # Get network output (7 outputs now including damage_info)
+        # Get network output
         action_idx, policy, value, hp_pred, seq_pred, self.hidden_states, damage_info = self.network.get_action(
-            frames, actions, cooldowns_t, self.skill_to_action, self.hidden_states
+            frames, actions, cooldowns_t, enemy_states, self.skill_to_action, self.hidden_states
         )
         
-        # Safety override: if danger predicted in next 3 frames
-        if hp_pred[:3].max() > self.danger_threshold:
+        # Safety override: if danger predicted in next 3 frames (Stage 4 check)
+        # Only active in stage 3+ or explicit stage 4
+        if self.stage >= 4 and hp_pred[:3].max() > self.danger_threshold:
             # Use sequence predictor's first action
             action_idx = int(seq_pred[0])
         
@@ -248,15 +321,13 @@ class TemporalAgent:
             cooldowns=cooldowns,
             rewards=np.array(list(self.reward_buffer)),
             hp_deltas=np.array(list(self.hp_delta_buffer)),
+            enemy_states=np.array(list(self.enemy_state_buffer)),
             done=done
         )
     
     def train_step(self, batch_size=8):
         """
         Perform one training step.
-        
-        Returns:
-            dict with loss values
         """
         if len(self.buffer) < batch_size:
             return None
@@ -269,13 +340,14 @@ class TemporalAgent:
         cooldowns = batch['cooldowns'].to(self.device)
         rewards = batch['rewards'].to(self.device)
         hp_deltas = batch['hp_deltas'].to(self.device)
+        enemy_states = batch['enemy_states'].to(self.device)
         
         # Update learning rate
         current_lr = self.update_lr()
         
         # Forward pass (6 outputs with damage_info)
         policy_logits, value, hp_pred, seq_logits, _, damage_info = self.network(
-            frames, actions, cooldowns
+            frames, actions, cooldowns, enemy_states
         )
         
         # --- Compute losses ---
@@ -314,21 +386,12 @@ class TemporalAgent:
         else:
             losses['sequence'] = torch.tensor(0.0)
         
-        # 5. Damage attribution loss - learn which frames/actions caused damage
+        # 5. Damage attribution loss - learn WHEN damage happens
         frame_scores = damage_info['frame_scores']  # [B, T]
-        action_danger = damage_info['action_danger']  # [B, 26]
-        
         # Target: frames with HP loss should have high attribution
         frame_damage_target = (hp_deltas < 0).float()  # [B, T]
         frame_attr_loss = F.binary_cross_entropy(frame_scores, frame_damage_target)
         losses['frame_attr'] = frame_attr_loss * 0.1
-        
-        # Action danger: actions taken when damage occurred should be penalized
-        actions_one_hot = F.one_hot(actions[:, -1], num_classes=26).float()  # [B, 26]
-        damage_mask = (hp_deltas[:, -1] < 0).float().unsqueeze(-1)  # [B, 1]
-        action_danger_target = actions_one_hot * damage_mask  # [B, 26]
-        action_danger_loss = F.binary_cross_entropy(action_danger, action_danger_target)
-        losses['action_danger'] = action_danger_loss * 0.1
         
         # Total loss
         total_loss = sum(losses.values())
@@ -393,7 +456,7 @@ class TemporalAgent:
         
     def load(self, path):
         """Load model checkpoint. Handles architecture changes gracefully."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         # Load network with strict=False to handle architecture changes
         missing, unexpected = self.network.load_state_dict(checkpoint['network_state_dict'], strict=False)
@@ -420,8 +483,11 @@ class TemporalAgent:
         self.action_buffer.clear()
         self.reward_buffer.clear()
         self.hp_delta_buffer.clear()
+        self.enemy_state_buffer.clear()
         self.hidden_states = None
+        self.prev_enemy_pos = None
         
         # Fill action buffer with zeros
         for _ in range(self.seq_len):
             self.action_buffer.append(0)
+            self.enemy_state_buffer.append(np.zeros(6, dtype=np.float32))

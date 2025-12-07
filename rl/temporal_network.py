@@ -246,7 +246,7 @@ class TemporalMuZeroNetwork(nn.Module):
     """
     Full temporal network with multihead outputs.
     """
-    def __init__(self, action_dim=26, hidden_dim=384, seq_len=30, freeze_backbone=True):
+    def __init__(self, action_dim=26, hidden_dim=512, seq_len=30, freeze_backbone=True):
         super().__init__()
         
         self.action_dim = action_dim
@@ -280,16 +280,19 @@ class TemporalMuZeroNetwork(nn.Module):
         # Global pool for transformer input
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         
-        # Transformer for sequence understanding
+        # Transformer for sequence understanding (Scaled Up: 4 Layers)
         self.transformer = TemporalTransformer(
             d_model=hidden_dim,
             nhead=4,
-            num_layers=2,
+            num_layers=4,
             action_dim=action_dim
         )
         
         # Cooldown embedding (4 skills)
         self.cooldown_embed = nn.Linear(4, hidden_dim)
+        
+        # Enemy State embedding (x, y, w, h, vx, vy)
+        self.enemy_state_proj = nn.Linear(6, hidden_dim)
         
         # --- Multihead Outputs ---
         
@@ -356,7 +359,7 @@ class TemporalMuZeroNetwork(nn.Module):
         
         return x
     
-    def forward(self, frames, past_actions, cooldowns, hidden_states=None):
+    def forward(self, frames, past_actions, cooldowns, enemy_state=None, hidden_states=None):
         """
         Forward pass.
         
@@ -364,6 +367,7 @@ class TemporalMuZeroNetwork(nn.Module):
             frames: [B, T, 3, H, W] - 30 RGB frames
             past_actions: [B, T] - past action indices
             cooldowns: [B, 4] - current cooldown state (0=available, 1=on cooldown)
+            enemy_state: [B, T, 6] - enemy numerical state (x, y, w, h, vx, vy)
             hidden_states: Optional ConvLSTM hidden states
             
         Returns:
@@ -395,6 +399,11 @@ class TemporalMuZeroNetwork(nn.Module):
         
         # 5. Add motion context to transformer input
         transformer_input = transformer_input + motion_padded
+        
+        # 5b. Add Enemy State context (Velocity/Position)
+        if enemy_state is not None:
+             enemy_features = self.enemy_state_proj(enemy_state)  # [B, T, hidden_dim]
+             transformer_input = transformer_input + enemy_features
         
         # 6. Transformer with action context
         transformer_out = self.transformer(transformer_input, past_actions)  # [B, T, hidden_dim]
@@ -460,7 +469,7 @@ class TemporalMuZeroNetwork(nn.Module):
         
         return masked
     
-    def get_action(self, frames, past_actions, cooldowns, skill_to_action_map=None, hidden_states=None):
+    def get_action(self, frames, past_actions, cooldowns, enemy_state=None, skill_to_action_map=None, hidden_states=None):
         """
         Get action with cooldown masking for inference.
         
@@ -475,17 +484,15 @@ class TemporalMuZeroNetwork(nn.Module):
         """
         with torch.no_grad():
             policy_logits, value, hp_pred, seq_logits, hidden_states, damage_info = self.forward(
-                frames, past_actions, cooldowns, hidden_states
+                frames, past_actions, cooldowns, enemy_state, hidden_states
             )
             
             # Apply cooldown mask if provided
             if skill_to_action_map is not None:
                 policy_logits = self.apply_cooldown_mask(policy_logits, cooldowns, skill_to_action_map)
             
-            # Also penalize actions that lead to damage based on learned danger
-            action_danger = damage_info['action_danger'].squeeze(0)  # [26]
-            # Subtract danger from logits (make dangerous actions less likely)
-            policy_logits = policy_logits - action_danger * 2.0
+            # NOTE: Removed action_danger penalty - it was discouraging combat actions
+            # The model should learn which actions are effective through rewards, not avoid actions
             
             # Softmax for probability
             policy = F.softmax(policy_logits, dim=-1)
@@ -502,7 +509,6 @@ class TemporalMuZeroNetwork(nn.Module):
                 seq_logits.squeeze(0).argmax(dim=-1).cpu().numpy(),
                 hidden_states,
                 {
-                    'action_danger': action_danger.cpu().numpy(),
                     'frame_scores': damage_info['frame_scores'].squeeze(0).cpu().numpy()
                 }
             )

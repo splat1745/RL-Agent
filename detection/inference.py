@@ -488,14 +488,13 @@ class Perception:
                                 # for this dtype on the current setup, causing crashes.
                                 
                                 # Apply torch.compile for speed
-                                if hasattr(torch, 'compile'):
-                                    print("Enabling torch.compile() for extra speed...")
-                                    try:
-                                        # Compile the internal model
-                                        # mode="reduce-overhead" is best for small batch inference
-                                        self.model.model.model = torch.compile(internal_model, mode="reduce-overhead")
-                                    except Exception as e:
-                                        print(f"torch.compile failed: {e}")
+                                    # Compile (Disabled on Windows due to missing Triton)
+                                    # if hasattr(torch, 'compile'):
+                                    #     print("Enabling torch.compile() for extra speed...")
+                                    #     try:
+                                    #         model.model.model = torch.compile(internal_model, mode="reduce-overhead")
+                                    #     except Exception as e:
+                                    #         print(f"torch.compile failed: {e}")
 
                             if self.half:
                                 internal_model.half()
@@ -545,7 +544,11 @@ class Perception:
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             
             # RF-DETR predict method
-            detections = self.model.predict(img_rgb, threshold=CONF_THRESHOLD)
+            if self.half and self.device == 'cuda':
+                with torch.amp.autocast('cuda'):
+                    detections = self.model.predict(img_rgb, threshold=CONF_THRESHOLD)
+            else:
+                detections = self.model.predict(img_rgb, threshold=CONF_THRESHOLD)
             
             results = []
             
