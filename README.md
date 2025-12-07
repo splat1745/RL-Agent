@@ -61,7 +61,7 @@ To halve training time, you need to maximize GPU usage.
 
 **Examples:**
 
-*   **High Performance (RTX 3090/4090):**
+*   **High Performance (RTX 4090/5090):**
     Doubles the workload per step compared to default.
     ```bash
     python pipeline.py train rfdetr s --batch 16 --grad-accum 1
