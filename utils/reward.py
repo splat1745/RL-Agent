@@ -97,14 +97,18 @@ def calculate_reward(obs, action_idx, state_manager):
                     
                     p_is_overlapping = 0.0
                     p_leaks_above = 0.0
+                    p_time_since_seen = 1.0 # Default to not seen
+                    
+                    if len(past_obs) > 9:
+                        p_time_since_seen = past_obs[9]
                     if len(past_obs) > 21:
                         p_is_overlapping = past_obs[21]
                     if len(past_obs) > 22:
                         p_leaks_above = past_obs[22]
                     
-                    # Conditions 1, 2, 3
-                    # Center (< 0.1), Overlapping (> 0.5), Leaks Above (> 0.5)
-                    if p_dist < 0.1 and p_is_overlapping > 0.5 and p_leaks_above > 0.5:
+                    # Conditions 1, 2, 3 + Visibility Check
+                    # Center (< 0.1), Overlapping (> 0.5), Leaks Above (> 0.5), Visible (< 0.1)
+                    if p_dist < 0.1 and p_is_overlapping > 0.5 and p_leaks_above > 0.5 and p_time_since_seen < 0.1:
                         # SUCCESS!
                         # "reward more for successful attacks"
                         reward += 3.0 # Increased from 2.0
@@ -122,7 +126,12 @@ def calculate_reward(obs, action_idx, state_manager):
     # --- CONSECUTIVE M1 REWARD ---
     # Reward chaining M1s (19)
     if action_idx == 19:
-        if state_manager.consecutive_m1_count > 0:
+        # Only reward if enemy is visible
+        is_visible = False
+        if len(obs) > 9 and obs[9] < 0.1:
+            is_visible = True
+            
+        if state_manager.consecutive_m1_count > 0 and is_visible:
             reward += 0.1 * min(5, state_manager.consecutive_m1_count) # Small bonus for chaining
     
     # --- REFLECTIVE LEARNING: DAMAGE ANALYSIS ---

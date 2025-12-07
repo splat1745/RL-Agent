@@ -2040,6 +2040,112 @@ class Perception:
 
         return obs
 
+    def get_pixel_obs_v2(self, frame):
+        """
+        V2 Pixel Observation - RGB only (no depth), single-channel flow.
+        
+        Returns:
+            {
+                'full': np.array [3, 160, 160], # RGB in [0, 1]
+                'crop': np.array [3, 128, 128], # RGB in [0, 1]
+                'flow': np.array [1, 160, 160]  # Magnitude in [0, 1]
+            }
+        """
+        if frame is None: 
+            return None
+        
+        # 1. Full Frame RGB (160x160)
+        full_img = cv2.resize(frame, (160, 160), interpolation=cv2.INTER_LINEAR)
+        full_rgb = cv2.cvtColor(full_img, cv2.COLOR_BGR2RGB)
+        full_norm = full_rgb.astype(np.float32) / 255.0
+        full_tensor = np.transpose(full_norm, (2, 0, 1))  # [3, 160, 160]
+        
+        # 2. Crop around player (128x128)
+        if self.last_det:
+            det_dict = self.last_det
+        else:
+            det_dict = self.detect(frame)
+            self.last_det = det_dict
+        
+        player = det_dict.get("player")
+        
+        # Use Kalman for smooth tracking
+        pred = self.kalman.predict()
+        pred_x, pred_y = float(pred[0]), float(pred[1])
+        
+        if player:
+            cx, cy = player[:2]
+            meas = np.array([[np.float32(cx)], [np.float32(cy)]])
+            self.kalman.correct(meas)
+            state = self.kalman.statePost
+            cx, cy = float(state[0]), float(state[1])
+        else:
+            cx, cy = pred_x, pred_y
+            
+        self.last_kalman_pred = (cx, cy)
+        
+        # Map to frame coords
+        h, w = frame.shape[:2]
+        scale_x, scale_y = w / INPUT_SIZE, h / INPUT_SIZE
+        pcx, pcy = int(cx * scale_x), int(cy * scale_y)
+        
+        crop_size = 128
+        half_crop = crop_size // 2
+        offset_y = int(crop_size * 0.25)
+        
+        center_y = max(half_crop, pcy - offset_y)
+        x1 = max(0, pcx - half_crop)
+        y1 = max(0, center_y - half_crop)
+        x2 = min(w, pcx + half_crop)
+        y2 = min(h, center_y + half_crop)
+        
+        if x1 >= x2 or y1 >= y2:
+            x1, y1 = max(0, w//2 - half_crop), max(0, h//2 - half_crop)
+            x2, y2 = min(w, x1 + crop_size), min(h, y1 + crop_size)
+        
+        crop_img = frame[y1:y2, x1:x2]
+        
+        # Pad if needed
+        if crop_img.shape[0] != crop_size or crop_img.shape[1] != crop_size:
+            padded = np.zeros((crop_size, crop_size, 3), dtype=np.uint8)
+            ph, pw = min(crop_img.shape[0], crop_size), min(crop_img.shape[1], crop_size)
+            padded[:ph, :pw] = crop_img[:ph, :pw]
+            crop_img = padded
+        
+        crop_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
+        crop_norm = crop_rgb.astype(np.float32) / 255.0
+        crop_tensor = np.transpose(crop_norm, (2, 0, 1))  # [3, 128, 128]
+        
+        # 3. Optical Flow (Single-channel magnitude)
+        gray = cv2.cvtColor(full_img, cv2.COLOR_BGR2GRAY)
+        
+        if self.last_gray is None:
+            flow_mag = np.zeros((160, 160), dtype=np.float32)
+        else:
+            flow_init = np.zeros((160, 160, 2), dtype=np.float32)
+            flow = cv2.calcOpticalFlowFarneback(
+                self.last_gray, gray, flow_init, 0.5, 3, 15, 3, 5, 1.2, 0
+            )
+            # Compute magnitude
+            flow_mag = np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)
+            
+            # Normalize to [0, 1]
+            max_mag = flow_mag.max()
+            if max_mag > 1e-6:
+                flow_mag = flow_mag / max_mag
+            else:
+                flow_mag = flow_mag * 0
+                
+        self.last_gray = gray
+        
+        flow_tensor = flow_mag[np.newaxis, ...]  # [1, 160, 160]
+        
+        return {
+            'full': full_tensor,
+            'crop': crop_tensor,
+            'flow': flow_tensor
+        }
+
     def get_pixel_obs(self, frame):
         """
         Generates pixel-based observation dictionary.

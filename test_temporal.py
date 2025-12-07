@@ -1,4 +1,4 @@
-"""Quick test for temporal network shapes."""
+w"""Quick test for temporal network shapes."""
 import torch
 from rl.temporal_network import TemporalMuZeroNetwork
 
