@@ -370,7 +370,8 @@ class PPOAgentV2:
     
     def load(self, filename):
         """Load model with compatibility handling."""
-        state = torch.load(filename, map_location=self.device)
+        # Fix for PyTorch 2.6+ weights_only=True default
+        state = torch.load(filename, map_location=self.device, weights_only=False)
         
         # Load policy
         if 'policy' in state:

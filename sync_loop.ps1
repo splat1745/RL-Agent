@@ -3,8 +3,13 @@ $IP = "192.168.0.173"
 $Password = "AboudBeast@2011$"
 
 $RemotePath = "~/Auto-Farmer"
-# Syncing RL Trajectories
-$LocalData = "D:\Auto-Farmer-Data\rl_train"
+# Syncing Imitation Training Data
+$LocalData = "D:\Auto-Farmer-Data\imitation_train"
+$RemoteDataPath = "~/Auto-Farmer/data/imitation"
+
+# Ensure remote directory exists
+Write-Host "Ensuring remote directory exists: $RemoteDataPath"
+ssh ${User}@${IP} "mkdir -p $RemoteDataPath"
 
 # Ensure local directory exists
 if (-not (Test-Path $LocalData)) {
@@ -15,27 +20,26 @@ if (-not (Test-Path $LocalData)) {
 $SentFiles = @{}
 $LogFile = "uploaded_traj.log"
 
+# ALWAYS check remote files to ensure sync state is correct
+Write-Host "Checking remote files to sync state..."
+try {
+    $RemoteFiles = ssh ${User}@${IP} "ls $RemoteDataPath"
+    if ($?) {
+        foreach ($file in $RemoteFiles) {
+            # Add both traj and data files to known list
+            if ($file -like "*.pkl") {
+                $SentFiles[$file] = $true
+            }
+        }
+        Write-Host "Discovered $($SentFiles.Count) files already on remote."
+    }
+} catch {
+    Write-Host "Could not check remote files. Relying on local log."
+}
+
+# Also load local log as backup
 if (Test-Path $LogFile) {
     Get-Content $LogFile | ForEach-Object { $SentFiles[$_] = $true }
-    Write-Host "Loaded $($SentFiles.Count) uploaded files from history."
-} else {
-    # Try to fetch existing files from remote to avoid initial re-upload
-    Write-Host "No history found. Checking remote files..."
-    try {
-        # Check files in rl_train/
-        $RemoteFiles = ssh ${User}@${IP} "ls ${RemotePath}/data/rl_train/"
-        if ($?) {
-            foreach ($file in $RemoteFiles) {
-                if ($file -like "traj_*.pkl") {
-                    $SentFiles[$file] = $true
-                    Add-Content -Path $LogFile -Value $file
-                }
-            }
-            Write-Host "Discovered $($SentFiles.Count) files already on remote."
-        }
-    } catch {
-        Write-Host "Could not check remote files. Will upload all local files."
-    }
 }
 
 Write-Host "Starting Sync Loop with $IP..."
@@ -43,7 +47,7 @@ Write-Host "Password: $Password"
 
 while ($true) {
     # 1. Find new .pkl files
-    $Files = Get-ChildItem $LocalData -Filter "traj_*.pkl"
+    $Files = Get-ChildItem $LocalData -Filter "data_*.pkl"
     $NewFiles = $Files | Where-Object { -not $SentFiles.ContainsKey($_.Name) }
 
     if ($NewFiles) {
@@ -51,8 +55,7 @@ while ($true) {
         foreach ($File in $NewFiles) {
             Write-Host "Uploading $($File.Name)..."
             # Suppress output for cleaner log
-            # Use data/rl_train/
-            scp $File.FullName ${User}@${IP}:${RemotePath}/data/rl_train/
+            scp $File.FullName ${User}@${IP}:$RemoteDataPath/
             
             if ($?) { 
                 $SentFiles[$File.Name] = $true 
@@ -63,11 +66,11 @@ while ($true) {
         }
     }
 
-    # 2. Pull updated model
-    # Pull ppo_agent.pth -> ppo_agent_new.pth
+    # 2. Pull updated model (V2)
+    # Pull ppo_v2.pth -> ppo_v2.pth
     Write-Host "Checking for model update..."
     # Suppress output (-q)
-    scp -q ${User}@${IP}:${RemotePath}/ppo_agent.pth ./ppo_agent_new.pth
+    scp -q ${User}@${IP}:${RemotePath}/ppo_v2.pth ./ppo_v2.pth
     
     if ($?) {
         Write-Host "Model upgrade downloaded! (ppo_agent_new.pth)" -ForegroundColor Green
