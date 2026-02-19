@@ -1,4 +1,4 @@
-# Auto-Farmer
+# RL-Agent
 
 An automated farming agent using Computer Vision and Reinforcement Learning. This project utilizes object detection models (YOLOv11, RF-DETR) to identify game elements and control inputs.
 
