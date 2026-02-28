@@ -41,28 +41,24 @@ import json
 import shutil
 
 # --- CONFIGURATION ---
-# Dynamic Data Root Detection
-DATA_ROOT = r"T:\Auto-Farmer-Data"
+# Dynamic Data Root Detection (cross-platform)
+# Priority: env var > ~/Auto-Farmer-Data > ./data
+_env_root = os.environ.get("AUTO_FARMER_DATA")
+_home_root = os.path.expanduser("~/Auto-Farmer-Data")
+_local_root = os.path.join(os.getcwd(), "data")
+
+if _env_root and os.path.exists(_env_root):
+    DATA_ROOT = _env_root
+elif os.path.exists(_home_root):
+    DATA_ROOT = _home_root
+else:
+    DATA_ROOT = _local_root
+
 if not os.path.exists(DATA_ROOT):
-    # Try other common locations
-    candidates = [
-        r"D:\Auto-Farmer-Data",
-        r"C:\Auto-Farmer-Data",
-        os.path.join(os.getcwd(), "data")
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            DATA_ROOT = path
-            break
-            
-# Ensure it exists (fallback to local if nothing found)
-if not os.path.exists(DATA_ROOT):
-    DATA_ROOT = os.path.join(os.getcwd(), "data")
-    if not os.path.exists(DATA_ROOT):
-        try:
-            os.makedirs(DATA_ROOT)
-        except OSError:
-            pass
+    try:
+        os.makedirs(DATA_ROOT)
+    except OSError:
+        pass
 
 if __name__ == "__main__":
     print(f"Active Data Root: {DATA_ROOT}")

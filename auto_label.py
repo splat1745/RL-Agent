@@ -8,9 +8,10 @@ import queue
 from ultralytics import YOLO
 from tqdm import tqdm
 
-# Configuration
-VIDEO_DIR = r"T:\Auto-Farmer-Data\frames"
-OUTPUT_DIR = r"T:\Auto-Farmer-Data\labels"
+# Configuration (cross-platform paths)
+_data_root = os.environ.get("AUTO_FARMER_DATA") or os.path.expanduser("~/Auto-Farmer-Data")
+VIDEO_DIR = os.path.join(_data_root, "frames")
+OUTPUT_DIR = os.path.join(_data_root, "labels")
 CONF_THRESHOLD = 0.4  # High confidence for players to avoid false positives
 PROJECTILE_MIN_AREA = 10
 PROJECTILE_MAX_AREA = 500

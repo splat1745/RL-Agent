@@ -1,116 +1,184 @@
-# INSTRUCTIONAL PIPELINE: VIDEO-BASED ROBLOX RL AGENT
+# ROBLOX PvP RL AGENT — PROJECT PLAN
 
 ## GOAL
-Build an RL agent that learns directly from recorded gameplay videos and understands:
-- Timing-based attacks
-- Projectiles
-- Movement spacing
-- Recovery frames
-- Heavy-attack windups
-- PvP dynamics
 
-The pipeline requires no live keyboard input. All training comes from video data.
+Build a real-time reinforcement learning agent for Roblox PvP combat that:
+- Captures the game screen live via `mss` (Linux/Windows)
+- Detects characters and throwables using YOLOv11 / RF-DETR
+- Learns combat behavior (attack timing, spacing, blocking, combos, projectile dodging) via imitation learning + PPO
+- Controls the game via `pynput` (Linux) / DirectInput (Windows) keyboard & mouse injection
 
-## 1. PREPARATION
-**Hardware**
-- Windows 10/11
-- NVIDIA GPU (e.g., 128-core CUDA support)
-- 64GB+ storage recommended
-- Python 3.11
-- PyTorch 2.x with CUDA support
-- OpenCV, TorchVision, PyTorch Lightning
+> **Platform**: Linux (Ubuntu) and Windows — uses `mss` + `pynput` + `xdotool` on Linux; `dxcam` + `pywin32` + `ctypes` on Windows
 
-**Folder Structure**
+---
+
+## ARCHITECTURE
+
 ```
-/RobloxRL/ (Current Workspace)
-    /data/
-        /raw_videos/      (On T: Drive)
-        /frames/          (On T: Drive)
-        /preproc/         (On T: Drive)
-        /labels/
-        /poses/
-        /combat_states/
-        /observations/
-    /models/
-        /base_models/
-        /student_model/
-    /main_agent/
-        /sensors/
-        /policy/
-        /rl/
-        /utils/
+┌─────────────────────────────────────────────────────────────────┐
+│                       LIVE AGENT  (main.py)                     │
+│                                                                 │
+│  DXcam Screen Capture  ──►  YOLOv11/RF-DETR Detection          │
+│         ▼                          ▼                            │
+│  Optical Flow (LK)        Observation Vector Builder            │
+│         ▼                          ▼                            │
+│       ╔══════════════════════════════════════╗                  │
+│       ║        TwoStreamNetwork              ║                  │
+│       ║  MobileNetV3 (full 160×160)          ║                  │
+│       ║  Custom CNN  (crop  128×128)         ║                  │
+│       ║  Flow CNN    (flow   160×160)        ║                  │
+│       ║  MLP Vector  (151-dim)               ║                  │
+│       ║        ── Fusion MLP ──              ║                  │
+│       ║     Stacked LSTM (2L × 768)          ║                  │
+│       ║   Multi-Branch Action Head           ║                  │
+│       ╚══════════════════════════════════════╝                  │
+│                         ▼                                       │
+│           26-Action Space → DirectInput SendInput               │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## 2. VIDEO DATA COLLECTION
-Record 3–5 hours of gameplay in 30–60 FPS using OBS.
-Include:
-- Normal fights
-- Blocking & dodging
-- Projectile spam
-- Different maps, lighting, UI visible
+### Action Space (26 Actions)
 
-Save videos to: `/data/raw_videos/` (Mapped to T: Drive)
+| ID | Action | ID | Action |
+|----|--------|----|----|
+| 0 | Idle | 13 | Skill 3 |
+| 1–4 | WASD | 14 | Skill 4 |
+| 5–6 | Turn L/R | 15 | R+2 Combo |
+| 7–10 | Directional Dashes | 16 | G |
+| 11–12 | Skill 1/2 | 17 | Jump (Space) |
+| 18 | Block (F) | 19 | M1 Attack |
+| 20–25 | Mouse micro/small/large turns | | |
 
-## 3. FRAME EXTRACTION
-Use OpenCV to extract frames directly from video.
-Extract at 10–20 FPS.
-Save as PNGs: `/data/frames/session_1/frame_00001.png`
+---
 
-## 4. PREPROCESSING (VIDEO-BASED)
-Instead of frame-by-frame manual preprocessing:
-Use 3D convolutional video models (e.g., R3D or TimeSformer) to automatically extract motion, appearance, and temporal features from video segments.
+## FOLDER STRUCTURE
 
-Steps:
-1. Input N-frame clips (e.g., 16–32 frames each)
-2. Extract feature embeddings capturing:
-   - Movement patterns
-   - Projectile motion
-   - Pose changes
-   - Action timing
-3. Save embeddings as .npy: `/data/preproc/session_1_clip_0001.npy`
+```
+RL-Agent/
+├── main.py                  # Live agent entry point (PPO / Imitation / Direct)
+├── pipeline.py              # Detection model training CLI (YOLO, RF-DETR)
+├── collect_data.py          # Manual/auto frame capture tool
+├── auto_label.py            # Auto-label frames with YOLO + optical flow
+├── train_imitation.py       # Behavior cloning from .pkl session recordings
+├── train_offline.py         # Offline PPO training on stored trajectories
+├── continuous_trainer.py    # Watches for new traj_*.pkl and trains PPO live
+├── data_pipeline.py         # Video frame extraction + R3D-18 feature extraction
+├── extract_frames.py        # Standalone frame extraction utility
+├── capture/
+│   └── capture.py           # Cross-platform screen capture (mss/Linux, dxcam/Windows)
+├── detection/
+│   └── inference.py         # YOLOv11/RF-DETR + LK tracker + health OCR (2400+ lines)
+├── control/
+│   ├── actions.py           # ACTION_MAP (26 actions)
+│   ├── keyboard_mouse.py    # Cross-platform keyboard/mouse (pynput/Linux, DirectInput/Windows)
+│   ├── input_listener.py    # Cross-platform human input polling (pynput/Linux, win32api/Windows)
+│   └── policy.py            # DirectPolicy (rule-based fallback)
+├── rl/
+│   ├── agent.py             # PPOAgent with truncated BPTT
+│   ├── network.py           # TwoStreamNetwork (MobileNetV3 + crop CNN + LSTM)
+│   ├── agent_v2.py          # Experimental agent v2
+│   ├── network_v2.py        # Experimental network v2
+│   ├── temporal_agent.py    # Temporal-focused agent variant
+│   ├── temporal_network.py  # Temporal network variant
+│   ├── muzero_agent.py      # MuZero agent variant
+│   ├── muzero_network.py    # MuZero network
+│   ├── memory.py            # Experience replay buffer
+│   ├── policy.py            # RL policy helpers
+│   └── pretrain.py          # Pretraining utilities
+├── utils/
+│   ├── config_wizard.py     # GUI health-bar ROI selection → config.json
+│   ├── reward.py            # Reward shaping (health, blocking, spacing)
+│   ├── state.py             # StateManager (health delta, hit history)
+│   ├── visualization.py     # Detection overlay drawing
+│   ├── feature_builder.py   # Feature construction helpers
+│   └── video_sampler.py     # Video sampling utility
+├── main_agent/
+│   ├── run_agent.py         # Advanced multi-sensor agent runner
+│   └── sensors/
+│       ├── object_detection/detector.py
+│       ├── pose_estimation/pose_estimator.py
+│       └── combat_state/inference.py
+└── data/                    # Auto-created; stores frames, labels, trajectories
+    ├── frames/
+    ├── labels/
+    └── trajectories/        # traj_*.pkl from live sessions
+```
 
-## 5. AUTO-LABELING
-Generate pseudo-labels from video:
-- **Projectile detection**: Use optical flow or video features to detect fast-moving objects. Cluster by color/motion.
-- **Player / Enemy detection**: Use pretrained YOLOv8 or MMPose with humanoid fine-tuning.
-- **Pose estimation**: Run video-based pose model on clips.
+---
 
-Save labels to `/data/labels/` and `/data/poses/`.
+## TRAINING PIPELINE
 
-## 6. DERIVE COMBAT STATES
-From pose + motion embeddings, generate combat states automatically:
-- Windup
-- Attack frame
-- Recovery
-- Idle / Dash / Projectile incoming
+### Stage 1 — Detection Model
 
-Save as: `/data/combat_states/session_1_clip_0001.json`
+1. **Capture raw frames**: `python collect_data.py`
+2. **Label in Roboflow** (classes: `character`, `throwable`)
+3. **Auto-label unlabeled frames**: `python auto_label.py`
+4. **Train detection model**: `python pipeline.py train rfdetr s`
+5. Best weights auto-saved to `runs/`
 
-## 7. SENSOR FUSION → OBSERVATION VECTOR
-Combine features per clip into a compact RL input.
-Save vectors: `/data/observations/session_1_clip_0001.pkl`
+### Stage 2 — Imitation Learning (Behavior Cloning)
 
-## 8. BEHAVIOR CLONING (IMITATION LEARNING)
-Align action proxies from video (Fast motion = attack, Freeze = idle).
-Train supervised policy network.
+1. Launch `main.py` and press `[I]` in the preview window to enter Imitation Mode
+2. Play normally; sessions auto-saved as `data/trajectories/traj_*.pkl`
+3. Train: `python train_imitation.py --data_dir data/trajectories --epochs 30`
+4. Outputs: `models/imitation_policy.pth`
 
-## 9. MULTI-MODEL ENSEMBLE & DISTILLATION
-Train 10–20 separate networks.
-Distill into a single student model.
+### Stage 3 — PPO Fine-Tuning
 
-## 10. REINFORCEMENT LEARNING (VIDEO-ONLY)
-Environment simulation: Replay video clips as environment.
-RL Algorithm: PPO or SAC.
-Rewards based on dodges, hits, spacing, etc.
+1. Run the live agent with the imitation policy; new `traj_*.pkl` files are written automatically
+2. `continuous_trainer.py` watches the trajectories folder and trains on each new file
+3. Or run offline: `python train_offline.py`
 
-## 11. CURRICULUM TRAINING
-Stages: Static target -> Moving target -> Simple bots -> Hard bots -> PvP.
+---
 
-## 12. DOMAIN RANDOMIZATION
-Randomize projectile speed, lighting, UI style.
+## NETWORK DETAILS
 
-## 13. FINAL AGENT SETUP
-Run inference on new videos or integrate with live gameplay screen later.
+**TwoStreamNetwork** (`rl/network.py`)
 
-## 14. OPTIONAL OPTIMIZATIONS
-Quantize networks, run policy on CPU, use CUDA graphs.
+| Stream | Input Shape | Architecture | Output Dim |
+|--------|-------------|-------------|------------|
+| Full Frame | `[B, 16, 160, 160]` (4-frame RGBD stack) | MobileNetV3-Large + 2-layer MLP | 1024 |
+| Fine Crop | `[B, 16, 128, 128]` | 4-layer CNN + AdaptiveAvgPool | 512 |
+| Optical Flow | `[B, 2, 160, 160]` | 3-layer CNN + AdaptiveAvgPool | 128 |
+| Vector | `[B, 151]` | 2-layer MLP | 128 |
+| Fusion | concat → 1792 | 3-layer MLP | 1024 |
+| Temporal | sequence | Stacked LSTM (2L × 768) | 768 |
+| Head | 768 | Combo-intention MLP → actor + critic | action_dim / 1 |
+
+---
+
+## REWARD DESIGN
+
+- **Chase**: negative Δdist to enemy × 2.0
+- **Target lock**: bonus for keeping enemy in screen center
+- **Block**: +2.0 for successful block (enemy attacking + no health loss)
+- **Action penalties**: penalize retreating or turning away when in range
+- **Delayed damage reflection** (1.618 s golden-ratio window): penalize moves followed by taking damage
+- **Health tracking** via `StateManager` (`utils/state.py`)
+
+---
+
+## COMPONENT STATUS
+
+| Component | Status |
+|-----------|--------|
+| Screen capture (mss/dxcam cross-platform) | Complete |
+| Detection (YOLOv11 / RF-DETR) | Complete |
+| TwoStreamNetwork + PPO | Complete |
+| Imitation learning pipeline | Complete |
+| Continuous PPO trainer | Complete |
+| Config wizard (health ROI) | Complete |
+| Auto-labeling (YOLO + optical flow) | Complete |
+| Linux / cross-platform input & capture | Complete |
+| Advanced sensor suite (main_agent/) | Partial |
+| MuZero / temporal variants | Experimental |
+
+---
+
+## FUTURE IMPROVEMENTS
+
+- Curriculum training: static target → moving → bots → PvP
+- Domain randomization: lighting, UI skin, projectile speed
+- Model quantization (FP8/INT8) for inference speedup
+- Ensemble distillation: train multiple policies, distill into one student model
+- Integrate pose estimation into the live observation vector

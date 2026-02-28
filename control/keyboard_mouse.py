@@ -1,302 +1,265 @@
+import sys
 import time
-import win32api
-import win32con
-import ctypes
 import threading
 
-# DirectInput Key Codes
-DIK_1 = 0x02
-DIK_2 = 0x03
-DIK_3 = 0x04
-DIK_4 = 0x05
-DIK_Q = 0x10
-DIK_W = 0x11
-DIK_R = 0x13
-DIK_A = 0x1E
-DIK_S = 0x1F
-DIK_D = 0x20
-DIK_F = 0x21
-DIK_G = 0x22
-DIK_SPACE = 0x39
+IS_WINDOWS = sys.platform == "win32"
 
-# C struct definitions
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", ctypes.c_ushort),
-                ("wScan", ctypes.c_ushort),
-                ("dwFlags", ctypes.c_ulong),
-                ("time", ctypes.c_ulong),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+if IS_WINDOWS:
+    import win32api
+    import win32con
+    import ctypes
 
-class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [("dx", ctypes.c_long),
-                ("dy", ctypes.c_long),
-                ("mouseData", ctypes.c_ulong),
-                ("dwFlags", ctypes.c_ulong),
-                ("time", ctypes.c_ulong),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+    # DirectInput scan codes (Windows only)
+    DIK_1 = 0x02
+    DIK_2 = 0x03
+    DIK_3 = 0x04
+    DIK_4 = 0x05
+    DIK_Q = 0x10
+    DIK_W = 0x11
+    DIK_R = 0x13
+    DIK_A = 0x1E
+    DIK_S = 0x1F
+    DIK_D = 0x20
+    DIK_F = 0x21
+    DIK_G = 0x22
+    DIK_SPACE = 0x39
 
-class HARDWAREINPUT(ctypes.Structure):
-    _fields_ = [("uMsg", ctypes.c_ulong),
-                ("wParamL", ctypes.c_ushort),
-                ("wParamH", ctypes.c_ushort)]
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
+                    ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
 
-class INPUT_I(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT),
-                ("mi", MOUSEINPUT),
-                ("hi", HARDWAREINPUT)]
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                    ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
+                    ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
 
-class INPUT(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_ulong),
-                ("ii", INPUT_I)]
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [("uMsg", ctypes.c_ulong), ("wParamL", ctypes.c_ushort),
+                    ("wParamH", ctypes.c_ushort)]
 
-def press_key(hexKeyCode):
-    extra = ctypes.c_ulong(0)
-    ii_ = ctypes.pointer(extra)
-    # type=1 is INPUT_KEYBOARD
-    # 0x0008 is KEYEVENTF_SCANCODE
-    inp = INPUT()
-    inp.type = 1
-    inp.ii.ki = KEYBDINPUT(0, hexKeyCode, 0x0008, 0, ii_)
-    ctypes.windll.user32.SendInput(1, ctypes.pointer(inp), ctypes.sizeof(inp))
+    class INPUT_I(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
 
-def release_key(hexKeyCode):
-    extra = ctypes.c_ulong(0)
-    ii_ = ctypes.pointer(extra)
-    # 0x0008 | 0x0002 (KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP)
-    inp = INPUT()
-    inp.type = 1
-    inp.ii.ki = KEYBDINPUT(0, hexKeyCode, 0x0008 | 0x0002, 0, ii_)
-    ctypes.windll.user32.SendInput(1, ctypes.pointer(inp), ctypes.sizeof(inp))
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_ulong), ("ii", INPUT_I)]
 
-def click():
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
-    time.sleep(0.05)
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
+    def press_key(hexKeyCode):
+        extra = ctypes.c_ulong(0)
+        ii_ = ctypes.pointer(extra)
+        inp = INPUT()
+        inp.type = 1
+        inp.ii.ki = KEYBDINPUT(0, hexKeyCode, 0x0008, 0, ii_)
+        ctypes.windll.user32.SendInput(1, ctypes.pointer(inp), ctypes.sizeof(inp))
 
-def move_mouse(x, y):
-    win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, x, y, 0, 0)
+    def release_key(hexKeyCode):
+        extra = ctypes.c_ulong(0)
+        ii_ = ctypes.pointer(extra)
+        inp = INPUT()
+        inp.type = 1
+        inp.ii.ki = KEYBDINPUT(0, hexKeyCode, 0x0008 | 0x0002, 0, ii_)
+        ctypes.windll.user32.SendInput(1, ctypes.pointer(inp), ctypes.sizeof(inp))
+
+    def click():
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
+        time.sleep(0.05)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
+
+    def move_mouse(x, y):
+        win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, int(x), int(y), 0, 0)
+
+    def _get_cursor_pos():
+        return win32api.GetCursorPos()
+
+else:
+    # Linux: use pynput for keyboard + mouse injection
+    from pynput.keyboard import Key as _Key, Controller as _KbCtrl
+    from pynput.mouse import Controller as _MsCtrl, Button as _Button
+
+    _kb = _KbCtrl()
+    _mouse = _MsCtrl()
+
+    # Map string key names to pynput key objects
+    _KEY_MAP = {
+        'w': 'w', 'a': 'a', 's': 's', 'd': 'd',
+        'q': 'q', 'f': 'f', 'r': 'r', 'g': 'g',
+        '1': '1', '2': '2', '3': '3', '4': '4',
+        'space': _Key.space,
+    }
+
+    def press_key(key_name: str):
+        """Press a key by name (e.g. 'w', '1', 'space')."""
+        k = _KEY_MAP.get(key_name, key_name)
+        _kb.press(k)
+
+    def release_key(key_name: str):
+        """Release a key by name."""
+        k = _KEY_MAP.get(key_name, key_name)
+        _kb.release(k)
+
+    def click():
+        _mouse.press(_Button.left)
+        time.sleep(0.05)
+        _mouse.release(_Button.left)
+
+    def move_mouse(x, y):
+        _mouse.move(int(x), int(y))
+
+    def _get_cursor_pos():
+        pos = _mouse.position
+        return (int(pos[0]), int(pos[1]))
+
+
+# ---------------------------------------------------------------------------
+# InputController — same public API on both platforms
+# ---------------------------------------------------------------------------
 
 class InputController:
     def __init__(self):
         self.current_key = None
-        # Mouse Constraint State
+
+        # Mouse vertical constraint state
         try:
-            self.start_mouse_pos = win32api.GetCursorPos()
-        except:
+            self.start_mouse_pos = _get_cursor_pos()
+        except Exception:
             self.start_mouse_pos = (0, 0)
-        self.accumulated_dy = 0 # Tracks vertical camera movement relative to start
-        
-        # Mouse Movement Tracking (Thread-Safe)
+        self.accumulated_dy = 0
+
+        # Thread-safe recent mouse movement accumulator
         self.recent_mouse_dx = 0
         self.recent_mouse_dy = 0
         self._lock = threading.Lock()
 
-        # Cooldown Management
+        # Cooldown management (populated by caller if needed)
         self.last_used = {}
-        # Removed hardcoded cooldowns to rely on visual detection
         self.cooldowns = {}
 
     def move_mouse_constrained(self, dx, dy):
-        """
-        Moves mouse with vertical constraint.
-        Constraint: 
-        - Cannot look UP past start (accumulated_dy >= 0)
-        - Cannot look DOWN past start_y pixels (accumulated_dy <= start_y)
-        Note: Mouse Down -> dy > 0. Mouse Up -> dy < 0.
-        """
-        # Proposed new accumulated dy
+        """Move mouse with vertical pitch clamp (no looking past horizon or floor)."""
         new_accum = self.accumulated_dy + dy
-        
-        # Clamp
-        # Limit UP: 0 (Start Pitch)
-        # Limit DOWN: self.start_mouse_pos[1] (Screen Height roughly)
         max_down = self.start_mouse_pos[1]
-        
+
         if new_accum < 0:
-            # Trying to go too high
-            dy = -self.accumulated_dy # Move just enough to reach 0
+            dy = -self.accumulated_dy
             new_accum = 0
         elif new_accum > max_down:
-            # Trying to go too low
             dy = max_down - self.accumulated_dy
             new_accum = max_down
-            
+
         self.accumulated_dy = new_accum
-        
+
         if dx != 0 or dy != 0:
-            win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, int(dx), int(dy), 0, 0)
+            move_mouse(int(dx), int(dy))
             with self._lock:
                 self.recent_mouse_dx += dx
                 self.recent_mouse_dy += dy
 
     def get_recent_movement(self):
-        """Returns accumulated mouse movement since last call."""
+        """Returns and resets accumulated mouse Δx, Δy since last call."""
         with self._lock:
-            dx = self.recent_mouse_dx
-            dy = self.recent_mouse_dy
+            dx, dy = self.recent_mouse_dx, self.recent_mouse_dy
             self.recent_mouse_dx = 0
             self.recent_mouse_dy = 0
         return dx, dy
 
     def execute(self, action_name, duration=0.1):
-        # Cooldown Check
-        check_name = action_name
-        if action_name == "r_2": check_name = "2" # Share cooldown key
-        if action_name == "2": check_name = "2"
-        
+        # Cooldown check
+        check_name = "2" if action_name in ("r_2", "2") else action_name
         if check_name in self.cooldowns:
-            last = self.last_used.get(check_name, 0)
-            if time.time() - last < self.cooldowns[check_name]:
-                # On Cooldown - Ignore
+            if time.time() - self.last_used.get(check_name, 0) < self.cooldowns[check_name]:
                 return
-            # Mark as used
             self.last_used[check_name] = time.time()
 
-        # Release previous key if different (and not a combo/instant)
+        # Release held key if switching
         if self.current_key and self.current_key != action_name:
             self._release(self.current_key)
             self.current_key = None
-        
+
         if action_name == "idle":
             time.sleep(duration)
             return
-        
-        if action_name == "click" or action_name == "m1":
+
+        if action_name in ("click", "m1"):
             click()
             time.sleep(0.1)
             return
-            
-        # Evasive Actions (Q + Direction)
-        if action_name == "dash_left":
-            press_key(DIK_A)
-            press_key(DIK_Q)
+
+        # Evasive dashes: direction + Q simultaneously
+        _DASH_MAP = {
+            "dash_left":    ("a", "q"),
+            "dash_right":   ("d", "q"),
+            "dash_back":    ("s", "q"),
+            "dash_forward": ("w", "q"),
+        }
+        if action_name in _DASH_MAP:
+            dir_key, mod_key = _DASH_MAP[action_name]
+            self._press(dir_key)
+            self._press(mod_key)
             time.sleep(0.05)
-            release_key(DIK_Q)
-            release_key(DIK_A)
+            self._release(mod_key)
+            self._release(dir_key)
             time.sleep(duration)
             return
 
-        if action_name == "dash_right":
-            press_key(DIK_D)
-            press_key(DIK_Q)
-            time.sleep(0.05)
-            release_key(DIK_Q)
-            release_key(DIK_D)
-            time.sleep(duration)
-            return
-
-        if action_name == "dash_back":
-            press_key(DIK_S)
-            press_key(DIK_Q)
-            time.sleep(0.05)
-            release_key(DIK_Q)
-            release_key(DIK_S)
-            time.sleep(duration)
-            return
-
-        if action_name == "dash_forward":
-            press_key(DIK_W)
-            press_key(DIK_Q)
-            time.sleep(0.05)
-            release_key(DIK_Q)
-            release_key(DIK_W)
-            time.sleep(duration)
-            return
-
-        # Combos
-        # r_1 removed
-
-        # Explicit Tap for Skills (1-4, F, R, G)
-        if action_name in ["1", "2", "3", "4", "f", "r", "g"]:
+        # Tap skills / special keys
+        if action_name in ("1", "2", "3", "4", "f", "r", "g"):
             self._press(action_name)
-            time.sleep(0.09) # Short press
+            time.sleep(0.09)
             self._release(action_name)
             time.sleep(duration)
             return
 
-        # Hold for Movement (WASD)
-        if action_name in ["w", "a", "s", "d", "q"]:
+        # Held movement keys (WASD, Q)
+        if action_name in ("w", "a", "s", "d", "q"):
             self._press(action_name)
             self.current_key = action_name
-            time.sleep(duration) # Hold the key
-            
-        elif action_name == "turn_left":
-            # Move mouse in chunks to simulate smooth turning over duration
-            steps = int(duration / 0.02)
-            if steps < 1: steps = 1
-            for _ in range(steps):
-                self.move_mouse_constrained(-35, 0) # Increased speed for responsiveness
-                time.sleep(0.01)
-                
-        elif action_name == "turn_right":
-            steps = int(duration / 0.02)
-            if steps < 1: steps = 1
-            for _ in range(steps):
-                self.move_mouse_constrained(35, 0) # Increased speed for responsiveness
-                time.sleep(0.01)
-
-        elif action_name == "turn_left_micro":
-            self.move_mouse_constrained(-5, 0)
             time.sleep(duration)
+            return
 
-        elif action_name == "turn_right_micro":
-            self.move_mouse_constrained(5, 0)
-            time.sleep(duration)
+        # Mouse turning actions
+        _TURN_ACTIONS = {
+            "turn_left":         (-35, 0),
+            "turn_right":        (35,  0),
+            "turn_left_micro":   (-5,  0),
+            "turn_right_micro":  (5,   0),
+            "turn_left_small":   (-10, 0),
+            "turn_right_small":  (10,  0),
+            "turn_left_large":   (-35, 0),
+            "turn_right_large":  (35,  0),
+        }
+        if action_name in _TURN_ACTIONS:
+            mx, my = _TURN_ACTIONS[action_name]
+            if action_name in ("turn_left_micro", "turn_right_micro"):
+                # Single-step micro turns
+                self.move_mouse_constrained(mx, my)
+                time.sleep(duration)
+            else:
+                steps = max(1, int(duration / 0.02))
+                for _ in range(steps):
+                    self.move_mouse_constrained(mx, my)
+                    time.sleep(0.01)
 
-        elif action_name == "turn_left_small":
-            steps = int(duration / 0.02)
-            if steps < 1: steps = 1
-            for _ in range(steps):
-                self.move_mouse_constrained(-10, 0) # Total ~20-30 depending on duration
-                time.sleep(0.01)
+    def _press(self, key: str):
+        if IS_WINDOWS:
+            _WIN_DIK = {
+                'w': DIK_W, 'a': DIK_A, 's': DIK_S, 'd': DIK_D,
+                'q': DIK_Q, 'f': DIK_F, 'r': DIK_R, 'g': DIK_G,
+                '1': DIK_1, '2': DIK_2, '3': DIK_3, '4': DIK_4,
+            }
+            if key in _WIN_DIK:
+                press_key(_WIN_DIK[key])
+        else:
+            press_key(key)
 
-        elif action_name == "turn_right_small":
-            steps = int(duration / 0.02)
-            if steps < 1: steps = 1
-            for _ in range(steps):
-                self.move_mouse_constrained(10, 0)
-                time.sleep(0.01)
-
-        elif action_name == "turn_left_large":
-            steps = int(duration / 0.02)
-            if steps < 1: steps = 1
-            for _ in range(steps):
-                self.move_mouse_constrained(-35, 0)
-                time.sleep(0.01)
-
-        elif action_name == "turn_right_large":
-            steps = int(duration / 0.02)
-            if steps < 1: steps = 1
-            for _ in range(steps):
-                self.move_mouse_constrained(35, 0)
-                time.sleep(0.01)
-
-        # Removed look_up and look_down from RL control
-
-    def _press(self, key):
-        if key == "w": press_key(DIK_W)
-        elif key == "a": press_key(DIK_A)
-        elif key == "s": press_key(DIK_S)
-        elif key == "d": press_key(DIK_D)
-        elif key == "q": press_key(DIK_Q)
-        elif key == "f": press_key(DIK_F)
-        elif key == "r": press_key(DIK_R)
-        elif key == "g": press_key(DIK_G)
-        elif key == "1": press_key(DIK_1)
-        elif key == "2": press_key(DIK_2)
-        elif key == "3": press_key(DIK_3)
-        elif key == "4": press_key(DIK_4)
-
-    def _release(self, key):
-        if key == "w": release_key(DIK_W)
-        elif key == "a": release_key(DIK_A)
-        elif key == "s": release_key(DIK_S)
-        elif key == "d": release_key(DIK_D)
-        elif key == "q": release_key(DIK_Q)
-        elif key == "f": release_key(DIK_F)
-        elif key == "r": release_key(DIK_R)
-        elif key == "g": release_key(DIK_G)
-        elif key == "1": release_key(DIK_1)
-        elif key == "2": release_key(DIK_2)
-        elif key == "3": release_key(DIK_3)
-        elif key == "4": release_key(DIK_4)
+    def _release(self, key: str):
+        if IS_WINDOWS:
+            _WIN_DIK = {
+                'w': DIK_W, 'a': DIK_A, 's': DIK_S, 'd': DIK_D,
+                'q': DIK_Q, 'f': DIK_F, 'r': DIK_R, 'g': DIK_G,
+                '1': DIK_1, '2': DIK_2, '3': DIK_3, '4': DIK_4,
+            }
+            if key in _WIN_DIK:
+                release_key(_WIN_DIK[key])
+        else:
+            release_key(key)

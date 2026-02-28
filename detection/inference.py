@@ -22,7 +22,9 @@ except ImportError:
 
 # --- Configuration ---
 # Updated: Now supports RF-DETR .pth files
-MODEL_PATH = r"D:\Auto-Farmer-Data\runs\seq_train_rfdetr_s\dataset5_run\checkpoint_best_ema.pth"
+# Set MODEL_PATH via env var AUTO_FARMER_MODEL, or pass it explicitly at runtime.
+_default_model = os.environ.get("AUTO_FARMER_MODEL", "")
+MODEL_PATH = _default_model if _default_model else None
 INPUT_SIZE = 640
 CONF_THRESHOLD = 0.20 # Lowered from 0.25
 IOU_THRESHOLD = 0.45
