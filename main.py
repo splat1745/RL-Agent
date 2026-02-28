@@ -433,9 +433,13 @@ def main():
         print(f"Using detection model: {detection_model_path}")
 
     # 1. Select Window
-    # capture_service.select_window()
-    print("Auto-selecting 'Roblox' window...")
-    capture_service.window_title = "Roblox"
+    # Set ROBLOX_WINDOW_TITLE env var to skip the interactive prompt.
+    _window_arg = os.environ.get("ROBLOX_WINDOW_TITLE", "")
+    if _window_arg:
+        print(f"Using window title from env: '{_window_arg}'")
+        capture_service.window_title = _window_arg
+    else:
+        capture_service.select_window()
     
     # Start Capture early to check resolution
     print("Starting Screen Capture...")

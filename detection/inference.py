@@ -485,18 +485,18 @@ class Perception:
                             
                             # Fast Mode Optimization
                             if self.fast_mode:
-                                print("Fast Mode Enabled: Using FP16 and torch.compile (if available).")
+                                print("Fast Mode Enabled: Using FP16 + torch.compile.")
                                 # Note: Native FP8 (float8_e4m3fn) is skipped because 'addmm_cuda' is not implemented 
                                 # for this dtype on the current setup, causing crashes.
                                 
-                                # Apply torch.compile for speed
-                                    # Compile (Disabled on Windows due to missing Triton)
-                                    # if hasattr(torch, 'compile'):
-                                    #     print("Enabling torch.compile() for extra speed...")
-                                    #     try:
-                                    #         model.model.model = torch.compile(internal_model, mode="reduce-overhead")
-                                    #     except Exception as e:
-                                    #         print(f"torch.compile failed: {e}")
+                                # torch.compile (requires Triton on Linux)
+                                if hasattr(torch, 'compile'):
+                                    print("Enabling torch.compile(mode='reduce-overhead') on RF-DETR...")
+                                    try:
+                                        model.model.model = torch.compile(internal_model, mode="reduce-overhead")
+                                        print("torch.compile applied to RF-DETR.")
+                                    except Exception as e:
+                                        print(f"torch.compile failed (non-fatal): {e}")
 
                             if self.half:
                                 internal_model.half()
@@ -525,7 +525,16 @@ class Perception:
                 # YOLO Model
                 model = YOLO(path)
                 
-                # Warmup
+                # torch.compile for YOLO
+                if self.fast_mode and hasattr(torch, 'compile'):
+                    print("Enabling torch.compile(mode='reduce-overhead') on YOLO...")
+                    try:
+                        model.model = torch.compile(model.model, mode="reduce-overhead")
+                        print("torch.compile applied to YOLO.")
+                    except Exception as e:
+                        print(f"torch.compile failed (non-fatal): {e}")
+
+                # Warmup (important: run AFTER compile so first compile happens here, not during live inference)
                 print("Warming up YOLO model...")
                 dummy = np.zeros((INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
                 _ = model(dummy, device=self.device, half=self.half, verbose=False)
